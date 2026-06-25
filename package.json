@@ -1,0 +1,13 @@
+{
+  "name": "amdp-crm-backend",
+  "version": "1.0.0",
+  "description": "Backend próprio do AMDP CRM (Node.js, sem dependências externas)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "private": true
+}

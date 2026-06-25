@@ -1,0 +1,14 @@
+services:
+  amdp-crm:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - JWT_SECRET=MUDE_ESTE_SEGREDO_PARA_UM_VALOR_FORTE
+      - DATA_DIR=/app/data
+      - CORS_ORIGIN=*
+      # - AGT_NIF_URL=https://.../contribuinte?nif={nif}
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
