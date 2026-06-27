@@ -147,6 +147,30 @@ const server = http.createServer(async (req, res) => {
         return sendJSON(res, 200, { token: signToken({ uid: u.id, email, role }), email, nome: u.nome || email, role });
       }
 
+      // ----- Alterar a própria palavra-passe (qualquer utilizador autenticado) -----
+      if (url === '/api/auth/password' && req.method === 'POST') {
+        const a = authUser(req); if (!a) return sendJSON(res, 401, { error: 'Sessão inválida' });
+        const b = await readBody(req); if (!b) return sendJSON(res, 400, { error: 'JSON inválido' });
+        const atual = String(b.currentPassword || ''); const nova = String(b.newPassword || '');
+        if (nova.length < 3) return sendJSON(res, 400, { error: 'A nova palavra-passe é demasiado curta' });
+        const db = loadDB(); const u = db.users.find(x => x.id === a.uid);
+        if (!u) return sendJSON(res, 404, { error: 'Conta não encontrada' });
+        if (!verifyPassword(atual, u.pass)) return sendJSON(res, 403, { error: 'Palavra-passe atual incorreta' });
+        u.pass = hashPassword(nova); saveDB(db);
+        return sendJSON(res, 200, { ok: true });
+      }
+
+      // ----- Registo de movimentos da empresa (só Administrador) -----
+      if (url.indexOf('/api/auditoria') === 0 && req.method === 'GET') {
+        const a = authUser(req); if (!a) return sendJSON(res, 401, { error: 'Sessão inválida' });
+        if (!isAdmin(a)) return sendJSON(res, 403, { error: 'Apenas o Administrador' });
+        const db = loadDB(); const store = (db.records && db.records[WS]) || {};
+        const lista = Object.keys(store).map(k => store[k])
+          .map(e => ({ tabela: e.tabela, registoId: e.registoId, op: e.op, ts: e.ts, autor: e.autor || '', ver: e.ver }))
+          .sort((x, y) => (y.ver || 0) - (x.ver || 0)).slice(0, 800);
+        return sendJSON(res, 200, { movimentos: lista });
+      }
+
       // ----- Gestão de contas de funcionários (só Administrador) -----
       if (url === '/api/users' && req.method === 'GET') {
         const a = authUser(req); if (!a) return sendJSON(res, 401, { error: 'Sessão inválida' });
@@ -289,3 +313,4 @@ try {
 
 server.listen(PORT, () => console.log('AMDP CRM backend a correr na porta ' + PORT));
 module.exports = { server, signToken, verifyToken, hashPassword, verifyPassword };
+
