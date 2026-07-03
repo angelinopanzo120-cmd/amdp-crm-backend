@@ -1,8 +1,8 @@
-FROM node:20-alpine
+# AMDP backend — sem dependências externas (usa o SQLite embutido do Node 22)
+FROM node:22-slim
 WORKDIR /app
 COPY . .
-ENV PORT=8080
-ENV DATA_DIR=/app/data
-ENV PUBLIC_DIR=/app
-EXPOSE 8080
+ENV NODE_ENV=production
+# A porta é definida pela Railway via variável PORT; 3000 é só informativo.
+EXPOSE 3000
 CMD ["node", "server.js"]
