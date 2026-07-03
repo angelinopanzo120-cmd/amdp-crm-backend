@@ -1,316 +1,416 @@
+/* ============================================================================
+   AMDP — Servidor de sincronização em tempo real (multi-utilizador)
+   ----------------------------------------------------------------------------
+   Implementa exactamente os endpoints que o sistema.html já chama:
+
+     POST /api/auth/register        {email,password}                -> {token,nome,role,email}
+     POST /api/auth/login           {email,password}                -> {token,nome,role,email}
+     POST /api/auth/password        {currentPassword,newPassword}   -> {ok}
+     GET  /api/dados                                                -> {dados:{...}}     (snapshot)
+     PUT  /api/dados                {dados:{...}}                   -> {ok}              (snapshot)
+     POST /api/sync/push            {clientId,changes:[...]}        -> {ver}             (tempo real)
+     GET  /api/sync/pull?since=N                                    -> {changes:[...],ver}
+     GET  /api/sync/stream?token=..&clientId=..                     -> SSE {changes,ver}
+     GET  /api/users                                                -> {users:[...]}     (admin)
+     POST /api/users/create         {email,password,nome,role}      -> {ok}              (admin)
+     POST /api/users/update         {id,nome,role,password?}        -> {ok}              (admin)
+     POST /api/users/delete         {id}                            -> {ok}              (admin)
+     GET  /api/auditoria                                            -> {movimentos:[...]}
+
+   Modelo de dados:
+     - Cada EMPRESA é um "tenant". O 1.º registo cria o tenant + Administrador.
+     - Cada FUNCIONÁRIO tem o seu email/palavra-passe (users), mas partilham o
+       mesmo tenant -> vêem os mesmos dados; a auditoria mostra quem fez o quê.
+     - Os dados são guardados REGISTO A REGISTO (tabela records), com um número
+       de versão monotónico por tenant -> sincronização incremental sem perdas.
+
+   Guardar tudo / não perder nada:
+     - SQLite em modo WAL, escritas serializadas e atómicas (transacção por push).
+     - Cliente reenvia lotes falhados; servidor atribui versão e confirma.
+     - Histórico de alterações fica na auditoria.
+   ========================================================================== */
+
 'use strict';
-/*
- * AMDP CRM — Backend próprio (Node.js, sem dependências externas)
- * - Autenticação por email + palavra-passe (scrypt) com token JWT (HS256)
- * - Sincronização do conjunto de dados por conta (pull/push)
- * - Serve o site (public/index.html)
- * - Proxy opcional para consulta de NIF na AGT (AGT_NIF_URL com {nif})
- *
- * Variáveis de ambiente (todas opcionais, com valores por defeito):
- *   PORT=8080
- *   JWT_SECRET=<gere um segredo forte>   (OBRIGATÓRIO em produção)
- *   DATA_DIR=./data                      (onde ficam os dados em disco)
- *   PUBLIC_DIR=./public                  (onde está o index.html)
- *   CORS_ORIGIN=*                        (origem permitida; use o seu domínio em produção)
- *   AGT_NIF_URL=                         (ex.: https://.../contribuinte?nif={nif})
- */
 const http = require('http');
-const fs = require('fs');
-const path = require('path');
 const crypto = require('crypto');
+const path = require('path');
+const fs = require('fs');
+const Database = require('better-sqlite3');
 
-const PORT = parseInt(process.env.PORT || '8080', 10);
-const JWT_SECRET = process.env.JWT_SECRET || 'troque-este-segredo-em-producao';
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
-const PUBLIC_DIR = process.env.PUBLIC_DIR || path.join(__dirname, 'public');
-const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
-const AGT_NIF_URL = process.env.AGT_NIF_URL || '';
+// ── Configuração (variáveis de ambiente) ───────────────────────────────────
+const PORT = process.env.PORT || 3000;
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data'); // monte um volume persistente aqui
+const AUTH_SECRET = process.env.AUTH_SECRET || 'troque-este-segredo-em-producao';
+const TOKEN_TTL_DAYS = Number(process.env.TOKEN_TTL_DAYS || 30);
 
-if (JWT_SECRET === 'troque-este-segredo-em-producao') {
-  console.warn('[AVISO] Defina a variável JWT_SECRET com um segredo forte antes de usar em produção.');
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+const db = new Database(path.join(DATA_DIR, 'amdp.db'));
+db.pragma('journal_mode = WAL');   // leituras concorrentes + durabilidade
+db.pragma('synchronous = NORMAL'); // bom equilíbrio segurança/velocidade
+db.pragma('foreign_keys = ON');
+
+// ── Esquema ─────────────────────────────────────────────────────────────────
+db.exec(`
+CREATE TABLE IF NOT EXISTS tenants (
+  id        TEXT PRIMARY KEY,
+  nome      TEXT,
+  ver       INTEGER NOT NULL DEFAULT 0,
+  criado_em TEXT
+);
+CREATE TABLE IF NOT EXISTS users (
+  id         TEXT PRIMARY KEY,
+  tenant_id  TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  email      TEXT NOT NULL,
+  pass_hash  TEXT NOT NULL,
+  nome       TEXT,
+  role       TEXT DEFAULT 'Comercial',
+  ativo      INTEGER NOT NULL DEFAULT 1,
+  criado_em  TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_users_email ON users(lower(email));
+CREATE TABLE IF NOT EXISTS records (
+  tenant_id   TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  tabela      TEXT NOT NULL,
+  registo_id  TEXT NOT NULL,
+  dados       TEXT,
+  deleted     INTEGER NOT NULL DEFAULT 0,
+  ver         INTEGER NOT NULL,
+  client_id   TEXT,
+  autor       TEXT,
+  updated_at  TEXT,
+  PRIMARY KEY (tenant_id, tabela, registo_id)
+);
+CREATE INDEX IF NOT EXISTS ix_records_ver ON records(tenant_id, ver);
+CREATE TABLE IF NOT EXISTS auditoria (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id  TEXT NOT NULL,
+  autor      TEXT,
+  op         TEXT,
+  tabela     TEXT,
+  registo_id TEXT,
+  ts         TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_audit_tenant ON auditoria(tenant_id, id DESC);
+CREATE TABLE IF NOT EXISTS fiscal_seq (
+  tenant_id TEXT NOT NULL,
+  chave     TEXT NOT NULL,
+  seq       INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (tenant_id, chave)
+);
+`);
+
+// ── Utilitários: palavra-passe (scrypt) e token (HMAC) ──────────────────────
+function hashPassword(pw) {
+  const salt = crypto.randomBytes(16);
+  const dk = crypto.scryptSync(String(pw), salt, 64);
+  return 'scrypt$' + salt.toString('hex') + '$' + dk.toString('hex');
 }
-
-/* ---------- Persistência simples em ficheiro (sem dependências) ---------- */
-const DB_FILE = path.join(DATA_DIR, 'db.json');
-const WS = 'empresa';  // espaço de dados partilhado por todos os funcionários
-function _ensure() { if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true }); if (!fs.existsSync(DB_FILE)) fs.writeFileSync(DB_FILE, JSON.stringify({ users: [], datasets: {}, records: {}, seq: {} })); }
-function loadDB() { _ensure(); try { return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); } catch (e) { return { users: [], datasets: {}, records: {}, seq: {} }; } }
-let _writeQueue = Promise.resolve();
-function saveDB(db) { const tmp = DB_FILE + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(db)); fs.renameSync(tmp, DB_FILE); }
-
-/* Consolida dados antigos (guardados por conta) num único espaço partilhado da empresa.
-   Corre uma só vez; preserva os dados já existentes escolhendo o conjunto com mais registos. */
-function migrarParaPartilhado(db) {
-  db.records = db.records || {}; db.seq = db.seq || {}; db.datasets = db.datasets || {};
-  if (db._wsMigrado) return db;
-  if (!db.records[WS]) {
-    let best = null, bestN = -1;
-    Object.keys(db.records).forEach(uid => { if (uid === WS) return; const n = Object.keys(db.records[uid] || {}).length; if (n > bestN) { bestN = n; best = uid; } });
-    db.records[WS] = best ? db.records[best] : {};
-    db.seq[WS] = best ? (db.seq[best] || 0) : 0;
-  }
-  if (!db.datasets[WS]) {
-    let best = null, bestN = -1;
-    Object.keys(db.datasets).forEach(uid => { if (uid === WS) return; const dd = (db.datasets[uid] && db.datasets[uid].dados) || {}; const n = Object.keys(dd).length; if (n > bestN) { bestN = n; best = uid; } });
-    db.datasets[WS] = best ? db.datasets[best] : { dados: {}, atualizado: null };
-  }
-  db._wsMigrado = true;
-  return db;
+function verifyPassword(pw, stored) {
+  try {
+    const parts = String(stored).split('$');
+    const salt = Buffer.from(parts[1], 'hex');
+    const hash = Buffer.from(parts[2], 'hex');
+    const dk = crypto.scryptSync(String(pw), salt, 64);
+    return dk.length === hash.length && crypto.timingSafeEqual(dk, hash);
+  } catch (e) { return false; }
 }
-function isAdmin(a) { return a && (a.role === 'Administrador' || a.role === 'admin'); }
-
-/* ---------- Auth: scrypt + JWT (HS256) ---------- */
-function hashPassword(pass) { const salt = crypto.randomBytes(16).toString('hex'); const dk = crypto.scryptSync(pass, salt, 32).toString('hex'); return salt + ':' + dk; }
-function verifyPassword(pass, stored) { try { const [salt, dk] = stored.split(':'); const test = crypto.scryptSync(pass, salt, 32).toString('hex'); return crypto.timingSafeEqual(Buffer.from(dk), Buffer.from(test)); } catch (e) { return false; } }
 function b64url(buf) { return Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); }
-function b64urlJSON(o) { return b64url(JSON.stringify(o)); }
 function signToken(payload) {
-  const header = b64urlJSON({ alg: 'HS256', typ: 'JWT' });
-  const body = b64urlJSON(Object.assign({ iat: Math.floor(Date.now() / 1000) }, payload));
-  const data = header + '.' + body;
-  const sig = b64url(crypto.createHmac('sha256', JWT_SECRET).update(data).digest());
-  return data + '.' + sig;
+  const body = b64url(JSON.stringify(payload));
+  const sig = b64url(crypto.createHmac('sha256', AUTH_SECRET).update(body).digest());
+  return body + '.' + sig;
 }
 function verifyToken(token) {
-  try {
-    const [h, b, s] = String(token || '').split('.');
-    if (!h || !b || !s) return null;
-    const expected = b64url(crypto.createHmac('sha256', JWT_SECRET).update(h + '.' + b).digest());
-    if (!crypto.timingSafeEqual(Buffer.from(s), Buffer.from(expected))) return null;
-    return JSON.parse(Buffer.from(b.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'));
-  } catch (e) { return null; }
+  if (!token) return null;
+  const i = token.lastIndexOf('.');
+  if (i < 0) return null;
+  const body = token.slice(0, i), sig = token.slice(i + 1);
+  const exp = b64url(crypto.createHmac('sha256', AUTH_SECRET).update(body).digest());
+  if (sig.length !== exp.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(exp))) return null;
+  let p; try { p = JSON.parse(Buffer.from(body.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString()); } catch (e) { return null; }
+  if (p.exp && Date.now() > p.exp) return null;
+  return p;
 }
+function newId(pfx) { return (pfx || '') + crypto.randomBytes(9).toString('hex'); }
+function now() { return new Date().toISOString(); }
+function isAdmin(role) { return /^admin/i.test(String(role || '')); }
 
-/* ---------- Tempo real (SSE) partilhado pela empresa ---------- */
-let _sseList = []; // [ {clientId, res} ]
-function sseAdd(clientId, res) { _sseList.push({ clientId: clientId, res: res }); }
-function sseRemove(res) { _sseList = _sseList.filter(c => c.res !== res); }
-function sseBroadcast(payload, exceptClientId) {
-  const data = 'data: ' + JSON.stringify(payload) + '\n\n';
-  _sseList.forEach(c => { if (c.clientId && c.clientId === exceptClientId) return; try { c.res.write(data); } catch (e) { } });
-}
+// ── Acesso a dados ──────────────────────────────────────────────────────────
+const Q = {
+  userByEmail: db.prepare('SELECT * FROM users WHERE lower(email)=lower(?)'),
+  userById: db.prepare('SELECT * FROM users WHERE id=?'),
+  usersByTenant: db.prepare('SELECT id,email,nome,role,ativo FROM users WHERE tenant_id=? ORDER BY criado_em'),
+  insTenant: db.prepare('INSERT INTO tenants(id,nome,ver,criado_em) VALUES(?,?,0,?)'),
+  insUser: db.prepare('INSERT INTO users(id,tenant_id,email,pass_hash,nome,role,ativo,criado_em) VALUES(?,?,?,?,?,?,1,?)'),
+  updUserPass: db.prepare('UPDATE users SET pass_hash=? WHERE id=?'),
+  updUser: db.prepare('UPDATE users SET nome=?, role=? WHERE id=? AND tenant_id=?'),
+  delUser: db.prepare('DELETE FROM users WHERE id=? AND tenant_id=?'),
+  tenantVer: db.prepare('SELECT ver FROM tenants WHERE id=?'),
+  bumpTenant: db.prepare('UPDATE tenants SET ver=? WHERE id=?'),
+  upsertRec: db.prepare(`INSERT INTO records(tenant_id,tabela,registo_id,dados,deleted,ver,client_id,autor,updated_at)
+                         VALUES(@tenant_id,@tabela,@registo_id,@dados,@deleted,@ver,@client_id,@autor,@updated_at)
+                         ON CONFLICT(tenant_id,tabela,registo_id) DO UPDATE SET
+                           dados=@dados, deleted=@deleted, ver=@ver, client_id=@client_id, autor=@autor, updated_at=@updated_at`),
+  changesSince: db.prepare('SELECT tabela,registo_id,dados,deleted FROM records WHERE tenant_id=? AND ver>? ORDER BY ver'),
+  allRecs: db.prepare('SELECT tabela,registo_id,dados FROM records WHERE tenant_id=? AND deleted=0'),
+  insAudit: db.prepare('INSERT INTO auditoria(tenant_id,autor,op,tabela,registo_id,ts) VALUES(?,?,?,?,?,?)'),
+  auditByTenant: db.prepare('SELECT autor,op,tabela,registo_id AS registoId,ts FROM auditoria WHERE tenant_id=? ORDER BY id DESC LIMIT 500'),
+};
 
-/* ---------- Utilitários HTTP ---------- */
-function cors(res) { res.setHeader('Access-Control-Allow-Origin', CORS_ORIGIN); res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization'); res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, OPTIONS'); }
-function sendJSON(res, code, obj) { cors(res); res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)); }
-function readBody(req) { return new Promise((resolve) => { let d = ''; req.on('data', c => { d += c; if (d.length > 25 * 1024 * 1024) req.destroy(); }); req.on('end', () => { try { resolve(d ? JSON.parse(d) : {}); } catch (e) { resolve(null); } }); }); }
-function authUser(req) { const h = req.headers['authorization'] || ''; const m = h.match(/^Bearer\s+(.+)$/i); if (!m) return null; return verifyToken(m[1]); }
-
-const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.png': 'image/png', '.jpg': 'image/jpeg', '.svg': 'image/svg+xml', '.ico': 'image/x-icon', '.json': 'application/json' };
-function serveStatic(req, res) {
-  let p = decodeURIComponent((req.url.split('?')[0]) || '/');
-  if (p === '/' || p === '') p = '/index.html';
-  const full = path.normalize(path.join(PUBLIC_DIR, p));
-  if (full.indexOf(path.normalize(PUBLIC_DIR)) !== 0) { res.writeHead(403); res.end('forbidden'); return; }
-  fs.readFile(full, (err, buf) => {
-    if (err) { // fallback para a SPA
-      fs.readFile(path.join(PUBLIC_DIR, 'index.html'), (e2, idx) => { if (e2) { res.writeHead(404); res.end('Not found'); } else { res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }); res.end(idx); } });
-      return;
-    }
-    res.writeHead(200, { 'Content-Type': MIME[path.extname(full)] || 'application/octet-stream' });
-    res.end(buf);
-  });
-}
-
-/* ---------- Servidor ---------- */
-const server = http.createServer(async (req, res) => {
-  const url = (req.url || '').split('?')[0];
-  if (req.method === 'OPTIONS') { cors(res); res.writeHead(204); res.end(); return; }
-
-  // -- API --
-  if (url.indexOf('/api/') === 0) {
-    try {
-      if (url === '/api/health') return sendJSON(res, 200, { ok: true, ts: new Date().toISOString() });
-
-      if (url === '/api/auth/register' && req.method === 'POST') {
-        const b = await readBody(req); if (!b) return sendJSON(res, 400, { error: 'JSON inválido' });
-        const email = String(b.email || '').trim().toLowerCase(); const pass = String(b.password || '');
-        if (!email || !pass) return sendJSON(res, 400, { error: 'Email e palavra-passe obrigatórios' });
-        const db = loadDB();
-        // Só permite registo livre para a PRIMEIRA conta (o Administrador). Depois, contas são criadas pelo Administrador.
-        if (db.users.length > 0) return sendJSON(res, 403, { error: 'O registo está fechado. Peça ao Administrador para criar a sua conta.' });
-        if (db.users.find(u => u.email === email)) return sendJSON(res, 409, { error: 'Já existe uma conta com esse email' });
-        const id = crypto.randomUUID();
-        const nome = String(b.nome || '').trim() || email;
-        const role = 'Administrador';
-        db.users.push({ id, email, pass: hashPassword(pass), nome, role, criado: new Date().toISOString() });
-        migrarParaPartilhado(db); saveDB(db);
-        return sendJSON(res, 200, { token: signToken({ uid: id, email, role }), email, nome, role });
-      }
-
-      if (url === '/api/auth/login' && req.method === 'POST') {
-        const b = await readBody(req); if (!b) return sendJSON(res, 400, { error: 'JSON inválido' });
-        const email = String(b.email || '').trim().toLowerCase(); const pass = String(b.password || '');
-        const db = loadDB(); const u = db.users.find(x => x.email === email);
-        if (!u || !verifyPassword(pass, u.pass)) return sendJSON(res, 401, { error: 'Credenciais inválidas' });
-        const role = u.role || 'Administrador';
-        return sendJSON(res, 200, { token: signToken({ uid: u.id, email, role }), email, nome: u.nome || email, role });
-      }
-
-      // ----- Alterar a própria palavra-passe (qualquer utilizador autenticado) -----
-      if (url === '/api/auth/password' && req.method === 'POST') {
-        const a = authUser(req); if (!a) return sendJSON(res, 401, { error: 'Sessão inválida' });
-        const b = await readBody(req); if (!b) return sendJSON(res, 400, { error: 'JSON inválido' });
-        const atual = String(b.currentPassword || ''); const nova = String(b.newPassword || '');
-        if (nova.length < 3) return sendJSON(res, 400, { error: 'A nova palavra-passe é demasiado curta' });
-        const db = loadDB(); const u = db.users.find(x => x.id === a.uid);
-        if (!u) return sendJSON(res, 404, { error: 'Conta não encontrada' });
-        if (!verifyPassword(atual, u.pass)) return sendJSON(res, 403, { error: 'Palavra-passe atual incorreta' });
-        u.pass = hashPassword(nova); saveDB(db);
-        return sendJSON(res, 200, { ok: true });
-      }
-
-      // ----- Registo de movimentos da empresa (só Administrador) -----
-      if (url.indexOf('/api/auditoria') === 0 && req.method === 'GET') {
-        const a = authUser(req); if (!a) return sendJSON(res, 401, { error: 'Sessão inválida' });
-        if (!isAdmin(a)) return sendJSON(res, 403, { error: 'Apenas o Administrador' });
-        const db = loadDB(); const store = (db.records && db.records[WS]) || {};
-        const lista = Object.keys(store).map(k => store[k])
-          .map(e => ({ tabela: e.tabela, registoId: e.registoId, op: e.op, ts: e.ts, autor: e.autor || '', ver: e.ver }))
-          .sort((x, y) => (y.ver || 0) - (x.ver || 0)).slice(0, 800);
-        return sendJSON(res, 200, { movimentos: lista });
-      }
-
-      // ----- Gestão de contas de funcionários (só Administrador) -----
-      if (url === '/api/users' && req.method === 'GET') {
-        const a = authUser(req); if (!a) return sendJSON(res, 401, { error: 'Sessão inválida' });
-        if (!isAdmin(a)) return sendJSON(res, 403, { error: 'Apenas o Administrador' });
-        const db = loadDB();
-        return sendJSON(res, 200, { users: db.users.map(u => ({ id: u.id, email: u.email, nome: u.nome, role: u.role, criado: u.criado })) });
-      }
-      if (url === '/api/users/create' && req.method === 'POST') {
-        const a = authUser(req); if (!a) return sendJSON(res, 401, { error: 'Sessão inválida' });
-        if (!isAdmin(a)) return sendJSON(res, 403, { error: 'Apenas o Administrador pode criar contas' });
-        const b = await readBody(req); if (!b) return sendJSON(res, 400, { error: 'JSON inválido' });
-        const email = String(b.email || '').trim().toLowerCase(); const pass = String(b.password || '');
-        const nome = String(b.nome || '').trim() || email; const role = String(b.role || '').trim() || 'Consulta';
-        if (!email || !pass) return sendJSON(res, 400, { error: 'Email e palavra-passe obrigatórios' });
-        const db = loadDB();
-        if (db.users.find(u => u.email === email)) return sendJSON(res, 409, { error: 'Já existe uma conta com esse email' });
-        const id = crypto.randomUUID();
-        db.users.push({ id, email, pass: hashPassword(pass), nome, role, criado: new Date().toISOString() });
-        saveDB(db);
-        return sendJSON(res, 200, { ok: true, user: { id, email, nome, role } });
-      }
-      if (url === '/api/users/update' && req.method === 'POST') {
-        const a = authUser(req); if (!a) return sendJSON(res, 401, { error: 'Sessão inválida' });
-        if (!isAdmin(a)) return sendJSON(res, 403, { error: 'Apenas o Administrador' });
-        const b = await readBody(req); if (!b || !b.id) return sendJSON(res, 400, { error: 'ID em falta' });
-        const db = loadDB(); const u = db.users.find(x => x.id === b.id);
-        if (!u) return sendJSON(res, 404, { error: 'Conta não encontrada' });
-        if (b.nome != null) u.nome = String(b.nome).trim() || u.nome;
-        if (b.role != null) u.role = String(b.role).trim() || u.role;
-        if (b.password) u.pass = hashPassword(String(b.password));
-        saveDB(db);
-        return sendJSON(res, 200, { ok: true, user: { id: u.id, email: u.email, nome: u.nome, role: u.role } });
-      }
-      if (url === '/api/users/delete' && req.method === 'POST') {
-        const a = authUser(req); if (!a) return sendJSON(res, 401, { error: 'Sessão inválida' });
-        if (!isAdmin(a)) return sendJSON(res, 403, { error: 'Apenas o Administrador' });
-        const b = await readBody(req); if (!b || !b.id) return sendJSON(res, 400, { error: 'ID em falta' });
-        const db = loadDB();
-        const u = db.users.find(x => x.id === b.id);
-        if (!u) return sendJSON(res, 404, { error: 'Conta não encontrada' });
-        if (u.id === a.uid) return sendJSON(res, 400, { error: 'Não pode apagar a sua própria conta' });
-        const admins = db.users.filter(x => isAdmin(x));
-        if (isAdmin(u) && admins.length <= 1) return sendJSON(res, 400, { error: 'Tem de existir pelo menos um Administrador' });
-        db.users = db.users.filter(x => x.id !== b.id);
-        saveDB(db);
-        return sendJSON(res, 200, { ok: true });
-      }
-
-      if (url === '/api/dados' && req.method === 'GET') {
-        const a = authUser(req); if (!a) return sendJSON(res, 401, { error: 'Sessão inválida' });
-        const db = loadDB(); const d = db.datasets[WS] || { dados: {}, atualizado: null };
-        return sendJSON(res, 200, d);
-      }
-
-      if (url === '/api/dados' && req.method === 'PUT') {
-        const a = authUser(req); if (!a) return sendJSON(res, 401, { error: 'Sessão inválida' });
-        const b = await readBody(req); if (!b || typeof b.dados !== 'object') return sendJSON(res, 400, { error: 'Payload inválido' });
-        _writeQueue = _writeQueue.then(() => {
-          const db = loadDB();
-          db.datasets[WS] = { dados: b.dados, atualizado: new Date().toISOString() };
-          saveDB(db);
-        });
-        await _writeQueue;
-        return sendJSON(res, 200, { ok: true, atualizado: new Date().toISOString() });
-      }
-
-      // ----- Sincronização por registo (delta) — espaço partilhado da empresa -----
-      if (url === '/api/sync/push' && req.method === 'POST') {
-        const a = authUser(req); if (!a) return sendJSON(res, 401, { error: 'Sessão inválida' });
-        const b = await readBody(req); if (!b || !Array.isArray(b.changes)) return sendJSON(res, 400, { error: 'Payload inválido' });
-        let resultVer = 0; const applied = [];
-        _writeQueue = _writeQueue.then(() => {
-          const db = loadDB();
-          db.records = db.records || {}; db.seq = db.seq || {};
-          db.records[WS] = db.records[WS] || {}; db.seq[WS] = db.seq[WS] || 0;
-          const store = db.records[WS];
-          b.changes.forEach(ch => {
-            if (!ch || ch.registoId == null || !ch.tabela) return;
-            const key = ch.tabela + '|' + ch.registoId;
-            const ex = store[key];
-            const ts = Number(ch.ts) || Date.now();
-            if (ex && Number(ex.ts) > ts) return; // mais recente prevalece
-            db.seq[WS]++;
-            const entry = { tabela: ch.tabela, registoId: ch.registoId, op: ch.op === 'delete' ? 'delete' : 'upsert', dados: ch.op === 'delete' ? null : ch.dados, ts: ts, ver: db.seq[WS], autor: a.email };
-            store[key] = entry; applied.push(entry);
-          });
-          resultVer = db.seq[WS];
-          saveDB(db);
-        });
-        await _writeQueue;
-        if (applied.length) sseBroadcast({ ver: resultVer, changes: applied }, b.clientId);
-        return sendJSON(res, 200, { ver: resultVer, aplicados: applied.length });
-      }
-
-      if (url.indexOf('/api/sync/pull') === 0 && req.method === 'GET') {
-        const a = authUser(req); if (!a) return sendJSON(res, 401, { error: 'Sessão inválida' });
-        const since = parseInt((req.url.split('since=')[1] || '0'), 10) || 0;
-        const db = loadDB(); const store = (db.records && db.records[WS]) || {}; const ver = (db.seq && db.seq[WS]) || 0;
-        const changes = Object.keys(store).map(k => store[k]).filter(e => e.ver > since).sort((x, y) => x.ver - y.ver);
-        return sendJSON(res, 200, { ver: ver, changes: changes });
-      }
-
-      if (url === '/api/sync/stream' && req.method === 'GET') {
-        const q = req.url.split('?')[1] || ''; const params = {}; q.split('&').forEach(kv => { const [k, v] = kv.split('='); params[k] = decodeURIComponent(v || ''); });
-        const a = verifyToken(params.token); if (!a) return sendJSON(res, 401, { error: 'Sessão inválida' });
-        cors(res);
-        res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
-        res.write(': ligado\n\n');
-        sseAdd(params.clientId || '', res);
-        const ping = setInterval(() => { try { res.write(': ping\n\n'); } catch (e) { } }, 25000);
-        req.on('close', () => { clearInterval(ping); sseRemove(res); });
-        return;
-      }
-
-      if (url.indexOf('/api/agt/nif/') === 0 && req.method === 'GET') {
-        const a = authUser(req); if (!a) return sendJSON(res, 401, { error: 'Sessão inválida' });
-        const nif = encodeURIComponent(url.split('/api/agt/nif/')[1] || '');
-        if (!AGT_NIF_URL) return sendJSON(res, 501, { error: 'Consulta AGT não configurada (defina AGT_NIF_URL no servidor).' });
-        try {
-          const upstream = AGT_NIF_URL.indexOf('{nif}') >= 0 ? AGT_NIF_URL.replace('{nif}', nif) : (AGT_NIF_URL + nif);
-          const r = await fetch(upstream);
-          const j = await r.json();
-          return sendJSON(res, 200, j);
-        } catch (e) { return sendJSON(res, 502, { error: 'Falha ao contactar a AGT: ' + (e.message || e) }); }
-      }
-
-      return sendJSON(res, 404, { error: 'Rota não encontrada' });
-    } catch (e) { return sendJSON(res, 500, { error: String(e && e.message || e) }); }
+// Aplica um lote de alterações de forma ATÓMICA e devolve a nova versão.
+const applyChanges = db.transaction((tenantId, clientId, autor, changes) => {
+  let ver = Q.tenantVer.get(tenantId).ver;
+  for (const ch of changes) {
+    if (!ch || !ch.tabela || ch.registoId == null) continue;
+    ver += 1;
+    const del = ch.op === 'delete' ? 1 : 0;
+    Q.upsertRec.run({
+      tenant_id: tenantId, tabela: String(ch.tabela), registo_id: String(ch.registoId),
+      dados: del ? null : JSON.stringify(ch.dados), deleted: del, ver: ver,
+      client_id: clientId || null, autor: autor || null, updated_at: now(),
+    });
+    Q.insAudit.run(tenantId, autor || '', del ? 'eliminar' : 'alterar', String(ch.tabela), String(ch.registoId), now());
   }
-
-  // -- Site estático --
-  serveStatic(req, res);
+  Q.bumpTenant.run(ver, tenantId);
+  return ver;
 });
 
-// Migração no arranque: consolida dados antigos (por conta) no espaço partilhado da empresa.
-try {
-  const _db = loadDB();
-  if (!_db._wsMigrado) { migrarParaPartilhado(_db); saveDB(_db); console.log('[migração] dados consolidados no espaço partilhado da empresa.'); }
-} catch (e) { console.warn('[migração] aviso:', e && e.message); }
+// Numeração fiscal sequencial e ATÓMICA (à prova de emissão simultânea em vários postos).
+// n = max(contador atual, mínimo enviado pelo cliente) + 1  → nunca repete nem recua.
+const nextFiscalSeq = db.transaction((tenantId, chave, min) => {
+  const row = db.prepare('SELECT seq FROM fiscal_seq WHERE tenant_id=? AND chave=?').get(tenantId, chave);
+  const base = Math.max(row ? row.seq : 0, Number(min) || 0);
+  const n = base + 1;
+  db.prepare('INSERT INTO fiscal_seq(tenant_id,chave,seq) VALUES(?,?,?) ON CONFLICT(tenant_id,chave) DO UPDATE SET seq=?').run(tenantId, chave, n, n);
+  return n;
+});
 
-server.listen(PORT, () => console.log('AMDP CRM backend a correr na porta ' + PORT));
-module.exports = { server, signToken, verifyToken, hashPassword, verifyPassword };
+// ── SSE: clientes ligados por tenant (distribuição em tempo real) ───────────
+const streams = new Map(); // tenantId -> Set<{res, clientId}>
+function broadcast(tenantId, originClientId, changes, ver) {
+  const set = streams.get(tenantId); if (!set || !set.size) return;
+  const payload = 'data: ' + JSON.stringify({ changes, ver }) + '\n\n';
+  for (const c of set) {
+    if (originClientId && c.clientId === originClientId) continue; // não devolver ao próprio emissor
+    try { c.res.write(payload); } catch (e) { }
+  }
+}
 
+// ── HTTP helpers ────────────────────────────────────────────────────────────
+function send(res, code, obj) {
+  const body = JSON.stringify(obj == null ? {} : obj);
+  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.end(body);
+}
+function cors(res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+  res.setHeader('Access-Control-Max-Age', '86400');
+}
+function readBody(req) {
+  return new Promise((resolve) => {
+    let d = ''; req.on('data', c => { d += c; if (d.length > 25 * 1024 * 1024) req.destroy(); });
+    req.on('end', () => { try { resolve(d ? JSON.parse(d) : {}); } catch (e) { resolve({}); } });
+    req.on('error', () => resolve({}));
+  });
+}
+function auth(req) {
+  const h = req.headers['authorization'] || '';
+  const tok = h.startsWith('Bearer ') ? h.slice(7) : (urlOf(req).searchParams.get('token') || '');
+  const p = verifyToken(tok);
+  if (!p) return null;
+  const u = Q.userById.get(p.uid);
+  if (!u || u.ativo === 0) return null;
+  return u; // {id,tenant_id,email,nome,role,...}
+}
+function urlOf(req) { return new URL(req.url, 'http://localhost'); }
+function tokenForUser(u) {
+  return signToken({ uid: u.id, tid: u.tenant_id, role: u.role, exp: Date.now() + TOKEN_TTL_DAYS * 864e5 });
+}
+
+// ── Servidor ────────────────────────────────────────────────────────────────
+const server = http.createServer(async (req, res) => {
+  cors(res);
+  if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
+  const u = urlOf(req);
+  const p = u.pathname;
+  try {
+    // — Saúde —
+    if (p === '/' || p === '/api/health') return send(res, 200, { ok: true, servico: 'AMDP sync', tempo: now() });
+
+    // — Registo (cria empresa + administrador) —
+    if (p === '/api/auth/register' && req.method === 'POST') {
+      const b = await readBody(req);
+      const email = String(b.email || '').trim().toLowerCase();
+      const pass = String(b.password || '');
+      if (!email || !pass) return send(res, 400, { error: 'Indique email e palavra-passe' });
+      if (Q.userByEmail.get(email)) return send(res, 409, { error: 'Já existe uma conta com esse email. Use Entrar.' });
+      const tid = newId('t_');
+      Q.insTenant.run(tid, email.split('@')[0] + ' (empresa)', now());
+      const uid = newId('u_');
+      const nome = email.split('@')[0];
+      Q.insUser.run(uid, tid, email, hashPassword(pass), nome, 'Administrador', now());
+      const user = Q.userById.get(uid);
+      return send(res, 200, { token: tokenForUser(user), nome: user.nome, role: user.role, email: user.email });
+    }
+
+    // — Entrar —
+    if (p === '/api/auth/login' && req.method === 'POST') {
+      const b = await readBody(req);
+      const email = String(b.email || '').trim().toLowerCase();
+      const pass = String(b.password || '');
+      const user = Q.userByEmail.get(email);
+      if (!user || user.ativo === 0 || !verifyPassword(pass, user.pass_hash)) return send(res, 401, { error: 'Email ou palavra-passe incorrectos' });
+      return send(res, 200, { token: tokenForUser(user), nome: user.nome, role: user.role, email: user.email });
+    }
+
+    // — Trocar a própria palavra-passe —
+    if (p === '/api/auth/password' && req.method === 'POST') {
+      const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
+      const b = await readBody(req);
+      if (!verifyPassword(String(b.currentPassword || ''), me.pass_hash)) return send(res, 400, { error: 'Palavra-passe actual incorrecta' });
+      if (String(b.newPassword || '').length < 3) return send(res, 400, { error: 'Nova palavra-passe demasiado curta' });
+      Q.updUserPass.run(hashPassword(String(b.newPassword)), me.id);
+      return send(res, 200, { ok: true });
+    }
+
+    // — Snapshot completo (reserva/compatibilidade) —
+    if (p === '/api/dados' && req.method === 'GET') {
+      const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
+      const rows = Q.allRecs.all(me.tenant_id);
+      const dados = {};
+      for (const r of rows) {
+        const key = 'amdp_crm_' + r.tabela;
+        if (!dados[key]) dados[key] = [];
+        try { dados[key].push(JSON.parse(r.dados)); } catch (e) { }
+      }
+      Object.keys(dados).forEach(k => { dados[k] = JSON.stringify(dados[k]); });
+      return send(res, 200, { dados });
+    }
+    if (p === '/api/dados' && req.method === 'PUT') {
+      const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
+      const b = await readBody(req);
+      const dados = (b && b.dados) || {};
+      const changes = [];
+      Object.keys(dados).forEach(k => {
+        if (k.indexOf('amdp_crm_') !== 0) return;
+        const tabela = k.slice('amdp_crm_'.length);
+        if (tabela === 'auditoria') return;
+        let arr; try { arr = JSON.parse(typeof dados[k] === 'string' ? dados[k] : JSON.stringify(dados[k])); } catch (e) { return; }
+        if (Array.isArray(arr)) arr.forEach(rec => { if (rec && rec.id != null) changes.push({ tabela, registoId: rec.id, op: 'upsert', dados: rec }); });
+      });
+      const ver = applyChanges(me.tenant_id, null, me.nome, changes);
+      broadcast(me.tenant_id, null, changes.map(c => ({ tabela: c.tabela, registoId: c.registoId, op: 'upsert', dados: c.dados })), ver);
+      return send(res, 200, { ok: true, ver });
+    }
+
+    // — Sincronização incremental: ENVIAR —
+    if (p === '/api/sync/push' && req.method === 'POST') {
+      const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
+      const b = await readBody(req);
+      const changes = Array.isArray(b.changes) ? b.changes : [];
+      const clientId = b.clientId || null;
+      const ver = applyChanges(me.tenant_id, clientId, me.nome, changes);
+      broadcast(me.tenant_id, clientId, changes.map(c => ({
+        tabela: c.tabela, registoId: c.registoId, op: c.op === 'delete' ? 'delete' : 'upsert', dados: c.op === 'delete' ? null : c.dados,
+      })), ver);
+      return send(res, 200, { ver });
+    }
+
+    // — Sincronização incremental: DESCARREGAR (catch-up) —
+    if (p === '/api/sync/pull' && req.method === 'GET') {
+      const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
+      const since = Number(u.searchParams.get('since') || 0);
+      const rows = Q.changesSince.all(me.tenant_id, since);
+      const changes = rows.map(r => ({
+        tabela: r.tabela, registoId: r.registo_id, op: r.deleted ? 'delete' : 'upsert',
+        dados: r.deleted ? null : (() => { try { return JSON.parse(r.dados); } catch (e) { return null; } })(),
+      }));
+      const ver = Q.tenantVer.get(me.tenant_id).ver;
+      return send(res, 200, { changes, ver });
+    }
+
+    // — Tempo real: canal SSE —
+    if (p === '/api/sync/stream' && req.method === 'GET') {
+      const me = auth(req); if (!me) { res.writeHead(401); return res.end(); }
+      const clientId = u.searchParams.get('clientId') || newId('c_');
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      });
+      res.write('retry: 3000\n\n');
+      res.write(': ligado\n\n');
+      if (!streams.has(me.tenant_id)) streams.set(me.tenant_id, new Set());
+      const entry = { res, clientId };
+      streams.get(me.tenant_id).add(entry);
+      const ka = setInterval(() => { try { res.write(': ping\n\n'); } catch (e) { } }, 25000); // manter viva
+      req.on('close', () => { clearInterval(ka); const s = streams.get(me.tenant_id); if (s) s.delete(entry); });
+      return; // mantém a ligação aberta
+    }
+
+    // — Utilizadores (só Administrador) —
+    if (p === '/api/users' && req.method === 'GET') {
+      const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
+      if (!isAdmin(me.role)) return send(res, 403, { error: 'Apenas o Administrador' });
+      return send(res, 200, { users: Q.usersByTenant.all(me.tenant_id).map(x => ({ id: x.id, email: x.email, nome: x.nome, role: x.role, ativo: x.ativo !== 0 })) });
+    }
+    if (p === '/api/users/create' && req.method === 'POST') {
+      const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
+      if (!isAdmin(me.role)) return send(res, 403, { error: 'Apenas o Administrador' });
+      const b = await readBody(req);
+      const email = String(b.email || '').trim().toLowerCase();
+      const pass = String(b.password || '');
+      if (!email || !pass) return send(res, 400, { error: 'Email e palavra-passe obrigatórios' });
+      if (Q.userByEmail.get(email)) return send(res, 409, { error: 'Email já existe' });
+      Q.insUser.run(newId('u_'), me.tenant_id, email, hashPassword(pass), String(b.nome || email.split('@')[0]), String(b.role || 'Comercial'), now());
+      return send(res, 200, { ok: true });
+    }
+    if (p === '/api/users/update' && req.method === 'POST') {
+      const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
+      if (!isAdmin(me.role)) return send(res, 403, { error: 'Apenas o Administrador' });
+      const b = await readBody(req);
+      const target = Q.userById.get(String(b.id || ''));
+      if (!target || target.tenant_id !== me.tenant_id) return send(res, 404, { error: 'Conta não encontrada' });
+      Q.updUser.run(String(b.nome || target.nome), String(b.role || target.role), target.id, me.tenant_id);
+      if (b.password) Q.updUserPass.run(hashPassword(String(b.password)), target.id);
+      return send(res, 200, { ok: true });
+    }
+    if (p === '/api/users/delete' && req.method === 'POST') {
+      const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
+      if (!isAdmin(me.role)) return send(res, 403, { error: 'Apenas o Administrador' });
+      const b = await readBody(req);
+      const target = Q.userById.get(String(b.id || ''));
+      if (!target || target.tenant_id !== me.tenant_id) return send(res, 404, { error: 'Conta não encontrada' });
+      if (target.id === me.id) return send(res, 400, { error: 'Não pode eliminar a sua própria conta' });
+      Q.delUser.run(target.id, me.tenant_id);
+      return send(res, 200, { ok: true });
+    }
+
+    // — Numeração fiscal sequencial (atómica, partilhada entre postos) —
+    if (p === '/api/fiscal/next' && req.method === 'POST') {
+      const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
+      const b = await readBody(req);
+      const chave = String(b.key || '').slice(0, 80); if (!chave) return send(res, 400, { error: 'Chave em falta' });
+      const seq = nextFiscalSeq(me.tenant_id, chave, b.min);
+      return send(res, 200, { seq });
+    }
+
+    // — Auditoria (registo da empresa) —
+    if (p === '/api/auditoria' && req.method === 'GET') {
+      const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
+      if (!isAdmin(me.role)) return send(res, 403, { error: 'Apenas o Administrador' });
+      return send(res, 200, { movimentos: Q.auditByTenant.all(me.tenant_id) });
+    }
+
+    return send(res, 404, { error: 'Endpoint não encontrado' });
+  } catch (e) {
+    return send(res, 500, { error: 'Erro interno: ' + (e && e.message ? e.message : String(e)) });
+  }
+});
+
+server.listen(PORT, () => {
+  console.log('AMDP sync server a ouvir na porta ' + PORT + ' · dados em ' + DATA_DIR);
+});
