@@ -17,6 +17,7 @@ const http = require('http');
 const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
+const https = require('https');
 const { DatabaseSync } = require('node:sqlite');
 
 // ── Configuração (variáveis de ambiente) ───────────────────────────────────
@@ -24,6 +25,11 @@ const PORT = process.env.PORT || 3000;
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data'); // monte um volume persistente aqui
 const AUTH_SECRET = process.env.AUTH_SECRET || 'troque-este-segredo-em-producao';
 const TOKEN_TTL_DAYS = Number(process.env.TOKEN_TTL_DAYS || 30);
+// Recuperação de palavra-passe por email (Resend — API HTTP, sem dependências)
+const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
+const MAIL_FROM = process.env.MAIL_FROM || 'AMDP <onboarding@resend.dev>';
+const RESET_TTL_MIN = Number(process.env.RESET_TTL_MIN || 15);
+const APP_NAME = process.env.APP_NAME || 'AMDP';
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 const db = new DatabaseSync(path.join(DATA_DIR, 'amdp.db'));
@@ -79,6 +85,13 @@ CREATE TABLE IF NOT EXISTS fiscal_seq (
   seq       INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (tenant_id, chave)
 );
+CREATE TABLE IF NOT EXISTS pw_resets (
+  email     TEXT PRIMARY KEY,
+  code_hash TEXT NOT NULL,
+  expires   INTEGER NOT NULL,
+  attempts  INTEGER NOT NULL DEFAULT 0,
+  criado_em TEXT
+);
 `);
 
 // ── Utilitários: palavra-passe (scrypt) e token (HMAC) ──────────────────────
@@ -117,6 +130,24 @@ function newId(pfx) { return (pfx || '') + crypto.randomBytes(9).toString('hex')
 function now() { return new Date().toISOString(); }
 function isAdmin(role) { return /^admin/i.test(String(role || '')); }
 
+// ── Recuperação de palavra-passe: código + envio de email ───────────────────
+function hashCode(email, code) {
+  return crypto.createHmac('sha256', AUTH_SECRET).update(String(email).toLowerCase() + ':' + String(code)).digest('hex');
+}
+const _forgotRate = new Map(); // email -> timestamp do último pedido
+function sendEmail(to, subject, html) {
+  return new Promise((resolve) => {
+    if (!RESEND_API_KEY) { console.warn('[email] RESEND_API_KEY em falta — email NAO enviado para ' + to); return resolve(false); }
+    const payload = JSON.stringify({ from: MAIL_FROM, to: [to], subject: subject, html: html });
+    const rq = https.request({
+      hostname: 'api.resend.com', path: '/emails', method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + RESEND_API_KEY, 'Content-Length': Buffer.byteLength(payload) }
+    }, (resp) => { let d = ''; resp.on('data', c => d += c); resp.on('end', () => { const ok = resp.statusCode >= 200 && resp.statusCode < 300; if (!ok) console.error('[email] falhou ' + resp.statusCode + ' ' + d.slice(0, 200)); resolve(ok); }); });
+    rq.on('error', (e) => { console.error('[email] erro: ' + e.message); resolve(false); });
+    rq.write(payload); rq.end();
+  });
+}
+
 // ── Acesso a dados (statements preparados) ──────────────────────────────────
 const Q = {
   userByEmail: db.prepare('SELECT * FROM users WHERE lower(email)=lower(?)'),
@@ -140,6 +171,10 @@ const Q = {
   auditByTenant: db.prepare('SELECT autor,op,tabela,registo_id AS registoId,ts FROM auditoria WHERE tenant_id=? ORDER BY id DESC LIMIT 500'),
   fiscalGet: db.prepare('SELECT seq FROM fiscal_seq WHERE tenant_id=? AND chave=?'),
   fiscalSet: db.prepare('INSERT INTO fiscal_seq(tenant_id,chave,seq) VALUES(?,?,?) ON CONFLICT(tenant_id,chave) DO UPDATE SET seq=excluded.seq'),
+  resetGet: db.prepare('SELECT * FROM pw_resets WHERE email=?'),
+  resetSet: db.prepare('INSERT INTO pw_resets(email,code_hash,expires,attempts,criado_em) VALUES(?,?,?,0,?) ON CONFLICT(email) DO UPDATE SET code_hash=excluded.code_hash, expires=excluded.expires, attempts=0, criado_em=excluded.criado_em'),
+  resetDel: db.prepare('DELETE FROM pw_resets WHERE email=?'),
+  resetBump: db.prepare('UPDATE pw_resets SET attempts=attempts+1 WHERE email=?'),
 };
 
 // Transação simples (node:sqlite não tem helper próprio).
@@ -356,56 +391,4 @@ const server = http.createServer(async (req, res) => {
       const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
       if (!isAdmin(me.role)) return send(res, 403, { error: 'Apenas o Administrador' });
       const b = await readBody(req);
-      const email = String(b.email || '').trim().toLowerCase();
-      const pass = String(b.password || '');
-      if (!email || !pass) return send(res, 400, { error: 'Email e palavra-passe obrigatórios' });
-      if (Q.userByEmail.get(email)) return send(res, 409, { error: 'Email já existe' });
-      Q.insUser.run(newId('u_'), me.tenant_id, email, hashPassword(pass), String(b.nome || email.split('@')[0]), String(b.role || 'Comercial'), now());
-      return send(res, 200, { ok: true });
-    }
-    if (p === '/api/users/update' && req.method === 'POST') {
-      const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
-      if (!isAdmin(me.role)) return send(res, 403, { error: 'Apenas o Administrador' });
-      const b = await readBody(req);
-      const target = Q.userById.get(String(b.id || ''));
-      if (!target || target.tenant_id !== me.tenant_id) return send(res, 404, { error: 'Conta não encontrada' });
-      Q.updUser.run(String(b.nome || target.nome), String(b.role || target.role), target.id, me.tenant_id);
-      if (b.password) Q.updUserPass.run(hashPassword(String(b.password)), target.id);
-      return send(res, 200, { ok: true });
-    }
-    if (p === '/api/users/delete' && req.method === 'POST') {
-      const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
-      if (!isAdmin(me.role)) return send(res, 403, { error: 'Apenas o Administrador' });
-      const b = await readBody(req);
-      const target = Q.userById.get(String(b.id || ''));
-      if (!target || target.tenant_id !== me.tenant_id) return send(res, 404, { error: 'Conta não encontrada' });
-      if (target.id === me.id) return send(res, 400, { error: 'Não pode eliminar a sua própria conta' });
-      Q.delUser.run(target.id, me.tenant_id);
-      return send(res, 200, { ok: true });
-    }
-
-    // — Numeração fiscal sequencial (atómica, partilhada entre postos) —
-    if (p === '/api/fiscal/next' && req.method === 'POST') {
-      const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
-      const b = await readBody(req);
-      const chave = String(b.key || '').slice(0, 80); if (!chave) return send(res, 400, { error: 'Chave em falta' });
-      const seq = nextFiscalSeq(me.tenant_id, chave, b.min);
-      return send(res, 200, { seq });
-    }
-
-    // — Auditoria (registo da empresa) —
-    if (p === '/api/auditoria' && req.method === 'GET') {
-      const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
-      if (!isAdmin(me.role)) return send(res, 403, { error: 'Apenas o Administrador' });
-      return send(res, 200, { movimentos: Q.auditByTenant.all(me.tenant_id) });
-    }
-
-    return send(res, 404, { error: 'Endpoint não encontrado' });
-  } catch (e) {
-    return send(res, 500, { error: 'Erro interno: ' + (e && e.message ? e.message : String(e)) });
-  }
-});
-
-server.listen(PORT, () => {
-  console.log('AMDP sync server (node:sqlite) a ouvir na porta ' + PORT + ' · dados em ' + DATA_DIR);
-});
+      const ema
