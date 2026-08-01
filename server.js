@@ -391,4 +391,103 @@ const server = http.createServer(async (req, res) => {
       const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
       if (!isAdmin(me.role)) return send(res, 403, { error: 'Apenas o Administrador' });
       const b = await readBody(req);
-      const ema
+      const email = String(b.email || '').trim().toLowerCase();
+      const pass = String(b.password || '');
+      if (!email || !pass) return send(res, 400, { error: 'Email e palavra-passe obrigatórios' });
+      if (Q.userByEmail.get(email)) return send(res, 409, { error: 'Email já existe' });
+      Q.insUser.run(newId('u_'), me.tenant_id, email, hashPassword(pass), String(b.nome || email.split('@')[0]), String(b.role || 'Comercial'), now());
+      return send(res, 200, { ok: true });
+    }
+    if (p === '/api/users/update' && req.method === 'POST') {
+      const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
+      if (!isAdmin(me.role)) return send(res, 403, { error: 'Apenas o Administrador' });
+      const b = await readBody(req);
+      const target = Q.userById.get(String(b.id || ''));
+      if (!target || target.tenant_id !== me.tenant_id) return send(res, 404, { error: 'Conta não encontrada' });
+      Q.updUser.run(String(b.nome || target.nome), String(b.role || target.role), target.id, me.tenant_id);
+      if (b.password) Q.updUserPass.run(hashPassword(String(b.password)), target.id);
+      return send(res, 200, { ok: true });
+    }
+    if (p === '/api/users/delete' && req.method === 'POST') {
+      const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
+      if (!isAdmin(me.role)) return send(res, 403, { error: 'Apenas o Administrador' });
+      const b = await readBody(req);
+      const target = Q.userById.get(String(b.id || ''));
+      if (!target || target.tenant_id !== me.tenant_id) return send(res, 404, { error: 'Conta não encontrada' });
+      if (target.id === me.id) return send(res, 400, { error: 'Não pode eliminar a sua própria conta' });
+      Q.delUser.run(target.id, me.tenant_id);
+      return send(res, 200, { ok: true });
+    }
+
+    // — Numeração fiscal sequencial (atómica, partilhada entre postos) —
+    if (p === '/api/fiscal/next' && req.method === 'POST') {
+      const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
+      const b = await readBody(req);
+      const chave = String(b.key || '').slice(0, 80); if (!chave) return send(res, 400, { error: 'Chave em falta' });
+      const seq = nextFiscalSeq(me.tenant_id, chave, b.min);
+      return send(res, 200, { seq });
+    }
+
+    // — Auditoria (registo da empresa) —
+    if (p === '/api/auditoria' && req.method === 'GET') {
+      const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
+      if (!isAdmin(me.role)) return send(res, 403, { error: 'Apenas o Administrador' });
+      return send(res, 200, { movimentos: Q.auditByTenant.all(me.tenant_id) });
+    }
+
+    // — Recuperação: pedir código por email —
+    if (p === '/api/auth/forgot' && req.method === 'POST') {
+      const b = await readBody(req);
+      const email = String(b.email || '').trim().toLowerCase();
+      const generic = () => send(res, 200, { ok: true }); // resposta genérica (não revela se a conta existe)
+      if (!email) return generic();
+      const last = _forgotRate.get(email) || 0;
+      if (Date.now() - last < 60000) return generic();     // 1 pedido / 60s por email
+      _forgotRate.set(email, Date.now());
+      const user = Q.userByEmail.get(email);
+      if (user && Number(user.ativo) !== 0) {
+        const code = String(Math.floor(100000 + Math.random() * 900000)); // 6 digitos
+        Q.resetSet.run(email, hashCode(email, code), Date.now() + RESET_TTL_MIN * 60000, now());
+        const html = '<div style="font-family:Arial,Helvetica,sans-serif;max-width:480px;margin:auto;color:#0a2540">'
+          + '<h2 style="margin:0 0 8px">' + APP_NAME + ' - Recuperacao de palavra-passe</h2>'
+          + '<p>Recebemos um pedido para repor a palavra-passe da sua conta.</p>'
+          + '<p>O seu codigo de recuperacao e:</p>'
+          + '<p style="font-size:30px;font-weight:bold;letter-spacing:6px">' + code + '</p>'
+          + '<p>Este codigo expira em ' + RESET_TTL_MIN + ' minutos. Se nao foi voce a pedir, ignore este email.</p>'
+          + '</div>';
+        sendEmail(email, APP_NAME + ' - Codigo de recuperacao', html); // não aguardamos (resposta imediata e genérica)
+      }
+      return generic();
+    }
+
+    // — Recuperação: definir nova palavra-passe com o código —
+    if (p === '/api/auth/reset' && req.method === 'POST') {
+      const b = await readBody(req);
+      const email = String(b.email || '').trim().toLowerCase();
+      const code = String(b.code || '').trim();
+      const np = String(b.newPassword || '');
+      if (!email || !code || !np) return send(res, 400, { error: 'Dados incompletos' });
+      if (np.length < 3) return send(res, 400, { error: 'Nova palavra-passe demasiado curta' });
+      const row = Q.resetGet.get(email);
+      if (!row) return send(res, 400, { error: 'Codigo invalido ou expirado' });
+      if (Date.now() > Number(row.expires)) { Q.resetDel.run(email); return send(res, 400, { error: 'Codigo expirado. Peca um novo.' }); }
+      if (Number(row.attempts) >= 5) { Q.resetDel.run(email); return send(res, 400, { error: 'Demasiadas tentativas. Peca um novo codigo.' }); }
+      const a = Buffer.from(String(row.code_hash)); const bb = Buffer.from(hashCode(email, code));
+      const good = a.length === bb.length && crypto.timingSafeEqual(a, bb);
+      if (!good) { Q.resetBump.run(email); return send(res, 400, { error: 'Codigo invalido' }); }
+      const user = Q.userByEmail.get(email);
+      if (!user) { Q.resetDel.run(email); return send(res, 400, { error: 'Conta nao encontrada' }); }
+      Q.updUserPass.run(hashPassword(np), user.id);
+      Q.resetDel.run(email);
+      return send(res, 200, { ok: true });
+    }
+
+    return send(res, 404, { error: 'Endpoint não encontrado' });
+  } catch (e) {
+    return send(res, 500, { error: 'Erro interno: ' + (e && e.message ? e.message : String(e)) });
+  }
+});
+
+server.listen(PORT, () => {
+  console.log('AMDP sync server (node:sqlite) a ouvir na porta ' + PORT + ' · dados em ' + DATA_DIR);
+});
