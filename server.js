@@ -30,6 +30,13 @@ const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
 const MAIL_FROM = process.env.MAIL_FROM || 'AMDP <onboarding@resend.dev>';
 const RESET_TTL_MIN = Number(process.env.RESET_TTL_MIN || 15);
 const APP_NAME = process.env.APP_NAME || 'AMDP';
+// Armazenamento de ficheiros — Cloudflare R2 (S3), sem dependências
+const R2_ENDPOINT = (process.env.R2_ENDPOINT || '').replace(/\/$/, '');   // https://<acct>.r2.cloudflarestorage.com
+const R2_BUCKET = process.env.R2_BUCKET || '';
+const R2_ACCESS_KEY = process.env.R2_ACCESS_KEY || '';
+const R2_SECRET = process.env.R2_SECRET || '';
+const R2_PUBLIC_URL = (process.env.R2_PUBLIC_URL || '').replace(/\/$/, ''); // https://pub-xxxx.r2.dev
+const R2_OK = !!(R2_ENDPOINT && R2_BUCKET && R2_ACCESS_KEY && R2_SECRET && R2_PUBLIC_URL);
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 const db = new DatabaseSync(path.join(DATA_DIR, 'amdp.db'));
@@ -263,6 +270,39 @@ function tokenForUser(u) {
   return signToken({ uid: u.id, tid: u.tenant_id, role: u.role, exp: Date.now() + TOKEN_TTL_DAYS * 864e5 });
 }
 
+// ── Cloudflare R2 (upload S3 com assinatura SigV4, sem dependências) ─────────
+function _hmac(key, data) { return crypto.createHmac('sha256', key).update(data, 'utf8').digest(); }
+function _sha256hex(buf) { return crypto.createHash('sha256').update(buf).digest('hex'); }
+function r2Put(key, buf, contentType) {
+  return new Promise((resolve, reject) => {
+    try {
+      const host = R2_ENDPOINT.replace(/^https?:\/\//, '');
+      const canonicalUri = '/' + R2_BUCKET + '/' + key.split('/').map(encodeURIComponent).join('/');
+      const amzdate = new Date().toISOString().replace(/[:-]|\.\d{3}/g, '');
+      const datestamp = amzdate.slice(0, 8);
+      const region = 'auto', service = 's3';
+      const payloadHash = _sha256hex(buf);
+      const ct = contentType || 'application/octet-stream';
+      const canonicalHeaders = 'content-type:' + ct + '\nhost:' + host + '\nx-amz-content-sha256:' + payloadHash + '\nx-amz-date:' + amzdate + '\n';
+      const signedHeaders = 'content-type;host;x-amz-content-sha256;x-amz-date';
+      const canonicalRequest = ['PUT', canonicalUri, '', canonicalHeaders, signedHeaders, payloadHash].join('\n');
+      const scope = datestamp + '/' + region + '/' + service + '/aws4_request';
+      const stringToSign = ['AWS4-HMAC-SHA256', amzdate, scope, _sha256hex(Buffer.from(canonicalRequest, 'utf8'))].join('\n');
+      const kSigning = _hmac(_hmac(_hmac(_hmac('AWS4' + R2_SECRET, datestamp), region), service), 'aws4_request');
+      const signature = crypto.createHmac('sha256', kSigning).update(stringToSign, 'utf8').digest('hex');
+      const authorization = 'AWS4-HMAC-SHA256 Credential=' + R2_ACCESS_KEY + '/' + scope + ', SignedHeaders=' + signedHeaders + ', Signature=' + signature;
+      const rq = https.request({
+        method: 'PUT', host: host, path: canonicalUri,
+        headers: { 'Host': host, 'Content-Type': ct, 'Content-Length': buf.length, 'x-amz-content-sha256': payloadHash, 'x-amz-date': amzdate, 'Authorization': authorization }
+      }, (rs) => {
+        let body = ''; rs.on('data', c => body += c);
+        rs.on('end', () => { (rs.statusCode >= 200 && rs.statusCode < 300) ? resolve(true) : reject(new Error('R2 ' + rs.statusCode + ' ' + body.slice(0, 300))); });
+      });
+      rq.on('error', reject); rq.write(buf); rq.end();
+    } catch (e) { reject(e); }
+  });
+}
+
 // ── Servidor ────────────────────────────────────────────────────────────────
 const server = http.createServer(async (req, res) => {
   cors(res);
@@ -271,7 +311,27 @@ const server = http.createServer(async (req, res) => {
   const p = u.pathname;
   try {
     // — Saúde —
-    if (p === '/' || p === '/api/health') return send(res, 200, { ok: true, servico: 'AMDP sync', tempo: now() });
+    if (p === '/' || p === '/api/health') return send(res, 200, { ok: true, servico: 'AMDP sync', versao: 'areas-v2', areasNoServidor: true, r2: R2_OK, tempo: now() });
+
+    // — Upload de ficheiros para o R2 —
+    if (p === '/api/files' && req.method === 'POST') {
+      const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
+      if (!R2_OK) return send(res, 500, { error: 'Armazenamento de ficheiros não configurado no servidor' });
+      const b = await readBody(req);
+      let data = String(b.dataBase64 || b.data || '');
+      let ctype = String(b.type || '');
+      const mm = data.match(/^data:([^;]+);base64,(.*)$/);
+      if (mm) { ctype = ctype || mm[1]; data = mm[2]; }
+      if (!data) return send(res, 400, { error: 'Sem ficheiro' });
+      let buf; try { buf = Buffer.from(data, 'base64'); } catch (e) { return send(res, 400, { error: 'Ficheiro inválido' }); }
+      if (!buf.length) return send(res, 400, { error: 'Ficheiro vazio' });
+      const nome = String(b.name || 'ficheiro');
+      const ext = (nome.split('.').pop() || '').replace(/[^a-zA-Z0-9]/g, '').slice(0, 8).toLowerCase() || 'bin';
+      const key = me.tenant_id + '/' + newId('f_') + '_' + Date.now() + '.' + ext;
+      try { await r2Put(key, buf, ctype || 'application/octet-stream'); }
+      catch (e) { return send(res, 502, { error: 'Falha ao guardar no R2: ' + (e && e.message || e) }); }
+      return send(res, 200, { ok: true, url: R2_PUBLIC_URL + '/' + key, key: key, size: buf.length });
+    }
 
     // — Registo (cria empresa + administrador) —
     if (p === '/api/auth/register' && req.method === 'POST') {
