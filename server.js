@@ -94,6 +94,9 @@ CREATE TABLE IF NOT EXISTS pw_resets (
 );
 `);
 
+// migração idempotente: áreas de negócio por utilizador
+try { db.exec("ALTER TABLE users ADD COLUMN areas TEXT DEFAULT '[]'"); } catch (e) {}
+
 // ── Utilitários: palavra-passe (scrypt) e token (HMAC) ──────────────────────
 function hashPassword(pw) {
   const salt = crypto.randomBytes(16);
@@ -129,6 +132,8 @@ function verifyToken(token) {
 function newId(pfx) { return (pfx || '') + crypto.randomBytes(9).toString('hex'); }
 function now() { return new Date().toISOString(); }
 function isAdmin(role) { return /^admin/i.test(String(role || '')); }
+function _areasArr(v){ try{ var a=JSON.parse(v||'[]'); return Array.isArray(a)?a:[]; }catch(e){ return []; } }
+function _areasStr(v){ try{ if(Array.isArray(v)) return JSON.stringify(v.filter(Boolean)); if(typeof v==='string'){ var t=v.trim(); return t.charAt(0)==='['?t:JSON.stringify(t.split(',').map(function(x){return x.trim();}).filter(Boolean)); } return '[]'; }catch(e){ return '[]'; } }
 
 // ── Recuperação de palavra-passe: código + envio de email ───────────────────
 function hashCode(email, code) {
@@ -152,11 +157,11 @@ function sendEmail(to, subject, html) {
 const Q = {
   userByEmail: db.prepare('SELECT * FROM users WHERE lower(email)=lower(?)'),
   userById: db.prepare('SELECT * FROM users WHERE id=?'),
-  usersByTenant: db.prepare('SELECT id,email,nome,role,ativo FROM users WHERE tenant_id=? ORDER BY criado_em'),
+  usersByTenant: db.prepare('SELECT id,email,nome,role,areas,ativo FROM users WHERE tenant_id=? ORDER BY criado_em'),
   insTenant: db.prepare('INSERT INTO tenants(id,nome,ver,criado_em) VALUES(?,?,0,?)'),
-  insUser: db.prepare('INSERT INTO users(id,tenant_id,email,pass_hash,nome,role,ativo,criado_em) VALUES(?,?,?,?,?,?,1,?)'),
+  insUser: db.prepare('INSERT INTO users(id,tenant_id,email,pass_hash,nome,role,areas,ativo,criado_em) VALUES(?,?,?,?,?,?,?,1,?)'),
   updUserPass: db.prepare('UPDATE users SET pass_hash=? WHERE id=?'),
-  updUser: db.prepare('UPDATE users SET nome=?, role=? WHERE id=? AND tenant_id=?'),
+  updUser: db.prepare('UPDATE users SET nome=?, role=?, areas=? WHERE id=? AND tenant_id=?'),
   delUser: db.prepare('DELETE FROM users WHERE id=? AND tenant_id=?'),
   tenantVer: db.prepare('SELECT ver FROM tenants WHERE id=?'),
   bumpTenant: db.prepare('UPDATE tenants SET ver=? WHERE id=?'),
@@ -279,9 +284,9 @@ const server = http.createServer(async (req, res) => {
       Q.insTenant.run(tid, email.split('@')[0] + ' (empresa)', now());
       const uid = newId('u_');
       const nome = email.split('@')[0];
-      Q.insUser.run(uid, tid, email, hashPassword(pass), nome, 'Administrador', now());
+      Q.insUser.run(uid, tid, email, hashPassword(pass), nome, 'Administrador', '[]', now());
       const user = Q.userById.get(uid);
-      return send(res, 200, { token: tokenForUser(user), nome: user.nome, role: user.role, email: user.email });
+      return send(res, 200, { token: tokenForUser(user), nome: user.nome, role: user.role, email: user.email, areas: _areasArr(user.areas) });
     }
 
     // — Entrar —
@@ -291,7 +296,7 @@ const server = http.createServer(async (req, res) => {
       const pass = String(b.password || '');
       const user = Q.userByEmail.get(email);
       if (!user || Number(user.ativo) === 0 || !verifyPassword(pass, user.pass_hash)) return send(res, 401, { error: 'Email ou palavra-passe incorrectos' });
-      return send(res, 200, { token: tokenForUser(user), nome: user.nome, role: user.role, email: user.email });
+      return send(res, 200, { token: tokenForUser(user), nome: user.nome, role: user.role, email: user.email, areas: _areasArr(user.areas) });
     }
 
     // — Trocar a própria palavra-passe —
@@ -385,7 +390,7 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/users' && req.method === 'GET') {
       const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
       if (!isAdmin(me.role)) return send(res, 403, { error: 'Apenas o Administrador' });
-      return send(res, 200, { users: Q.usersByTenant.all(me.tenant_id).map(x => ({ id: x.id, email: x.email, nome: x.nome, role: x.role, ativo: Number(x.ativo) !== 0 })) });
+      return send(res, 200, { users: Q.usersByTenant.all(me.tenant_id).map(x => ({ id: x.id, email: x.email, nome: x.nome, role: x.role, ativo: Number(x.ativo) !== 0, areas: _areasArr(x.areas) })) });
     }
     if (p === '/api/users/create' && req.method === 'POST') {
       const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
@@ -395,7 +400,7 @@ const server = http.createServer(async (req, res) => {
       const pass = String(b.password || '');
       if (!email || !pass) return send(res, 400, { error: 'Email e palavra-passe obrigatórios' });
       if (Q.userByEmail.get(email)) return send(res, 409, { error: 'Email já existe' });
-      Q.insUser.run(newId('u_'), me.tenant_id, email, hashPassword(pass), String(b.nome || email.split('@')[0]), String(b.role || 'Comercial'), now());
+      Q.insUser.run(newId('u_'), me.tenant_id, email, hashPassword(pass), String(b.nome || email.split('@')[0]), String(b.role || 'Comercial'), _areasStr(b.areas), now());
       return send(res, 200, { ok: true });
     }
     if (p === '/api/users/update' && req.method === 'POST') {
@@ -404,7 +409,7 @@ const server = http.createServer(async (req, res) => {
       const b = await readBody(req);
       const target = Q.userById.get(String(b.id || ''));
       if (!target || target.tenant_id !== me.tenant_id) return send(res, 404, { error: 'Conta não encontrada' });
-      Q.updUser.run(String(b.nome || target.nome), String(b.role || target.role), target.id, me.tenant_id);
+      Q.updUser.run(String(b.nome || target.nome), String(b.role || target.role), (b.areas !== undefined ? _areasStr(b.areas) : (target.areas || '[]')), target.id, me.tenant_id);
       if (b.password) Q.updUserPass.run(hashPassword(String(b.password)), target.id);
       return send(res, 200, { ok: true });
     }
