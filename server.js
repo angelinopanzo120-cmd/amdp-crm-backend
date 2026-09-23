@@ -25,6 +25,8 @@ const PORT = process.env.PORT || 3000;
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data'); // monte um volume persistente aqui
 const AUTH_SECRET = process.env.AUTH_SECRET || 'troque-este-segredo-em-producao';
 const TOKEN_TTL_DAYS = Number(process.env.TOKEN_TTL_DAYS || 30);
+const BACKUP_DIR = path.join(DATA_DIR, 'backups');   // cópias diárias da base de dados
+const BACKUP_KEEP = Number(process.env.BACKUP_KEEP || 14); // quantas manter
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 const db = new DatabaseSync(path.join(DATA_DIR, 'amdp.db'));
@@ -128,6 +130,22 @@ function isAdmin(role) { return /^admin/i.test(String(role || '')); }
 
 // ── Segurança de autenticação: força da palavra-passe + travão de tentativas ─
 function senhaFraca(pw){ pw=String(pw||''); return pw.length<8 || !/[A-Za-z]/.test(pw) || !/[0-9]/.test(pw); }
+// ── Cópia de segurança automática da base de dados ──────────────────────────
+function fazerBackup(){
+  try{
+    if(!fs.existsSync(BACKUP_DIR)) fs.mkdirSync(BACKUP_DIR, { recursive: true });
+    try{ db.exec('PRAGMA wal_checkpoint(TRUNCATE);'); }catch(e){}   // junta o WAL ao ficheiro principal
+    const src = path.join(DATA_DIR, 'amdp.db');
+    if(!fs.existsSync(src)) return null;
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const dest = path.join(BACKUP_DIR, 'amdp-' + stamp + '.db');
+    fs.copyFileSync(src, dest);
+    let files = fs.readdirSync(BACKUP_DIR).filter(f => /^amdp-.*\.db$/.test(f)).sort();
+    while(files.length > BACKUP_KEEP){ const old = files.shift(); try{ fs.unlinkSync(path.join(BACKUP_DIR, old)); }catch(e){} }
+    console.log('[backup] criado ' + dest + ' (' + files.length + ' cópias)');
+    return dest;
+  }catch(e){ console.warn('[backup] falhou:', e && e.message ? e.message : e); return null; }
+}
 const REGRA_SENHA = 'Palavra-passe fraca: use pelo menos 8 caracteres, com letras e números.';
 const _loginTent = new Map(); // chave(email|ip) -> {fails, until}
 function _loginChave(req, email){ const xf=String(req.headers['x-forwarded-for']||'').split(',')[0].trim(); const ip=xf||(req.socket&&req.socket.remoteAddress)||''; return String(email||'')+'|'+ip; }
@@ -538,6 +556,32 @@ const server = http.createServer(async (req, res) => {
       return res.end(buf);
     }
 
+    // — Cópias de segurança (administrador) —
+    if (p === '/api/backups' && req.method === 'GET') {
+      const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
+      if (!isAdmin(me.role)) return send(res, 403, { error: 'Apenas o Administrador' });
+      let arr = [];
+      try { if (fs.existsSync(BACKUP_DIR)) arr = fs.readdirSync(BACKUP_DIR).filter(f => /^amdp-.*\.db$/.test(f)).sort().reverse().map(f => { const st = fs.statSync(path.join(BACKUP_DIR, f)); return { nome: f, bytes: st.size, data: st.mtime.toISOString() }; }); } catch (e) {}
+      return send(res, 200, { backups: arr, keep: BACKUP_KEEP });
+    }
+    if (p === '/api/backups/run' && req.method === 'POST') {
+      const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
+      if (!isAdmin(me.role)) return send(res, 403, { error: 'Apenas o Administrador' });
+      const d = fazerBackup();
+      return d ? send(res, 200, { ok: true }) : send(res, 500, { error: 'Não foi possível criar a cópia' });
+    }
+    if (p === '/api/backups/download' && req.method === 'GET') {
+      const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
+      if (!isAdmin(me.role)) return send(res, 403, { error: 'Apenas o Administrador' });
+      const nome = String(u.searchParams.get('name') || '');
+      if (!/^amdp-[\w:-]+\.db$/.test(nome)) return send(res, 400, { error: 'Nome inválido' });
+      const fp = path.join(BACKUP_DIR, nome);
+      if (!fs.existsSync(fp)) return send(res, 404, { error: 'Cópia não encontrada' });
+      const buf = fs.readFileSync(fp);
+      res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Disposition': 'attachment; filename="' + nome + '"', 'Content-Length': buf.length });
+      return res.end(buf);
+    }
+
     return send(res, 404, { error: 'Endpoint não encontrado' });
   } catch (e) {
     return send(res, 500, { error: 'Erro interno: ' + (e && e.message ? e.message : String(e)) });
@@ -546,4 +590,5 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   console.log('AMDP sync server (node:sqlite) a ouvir na porta ' + PORT + ' · dados em ' + DATA_DIR);
+  try { setTimeout(fazerBackup, 60 * 1000); setInterval(fazerBackup, 24 * 60 * 60 * 1000); } catch (e) {}
 });
