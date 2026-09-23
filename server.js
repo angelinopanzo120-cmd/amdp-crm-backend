@@ -126,6 +126,15 @@ function newId(pfx) { return (pfx || '') + crypto.randomBytes(9).toString('hex')
 function now() { return new Date().toISOString(); }
 function isAdmin(role) { return /^admin/i.test(String(role || '')); }
 
+// ── Segurança de autenticação: força da palavra-passe + travão de tentativas ─
+function senhaFraca(pw){ pw=String(pw||''); return pw.length<8 || !/[A-Za-z]/.test(pw) || !/[0-9]/.test(pw); }
+const REGRA_SENHA = 'Palavra-passe fraca: use pelo menos 8 caracteres, com letras e números.';
+const _loginTent = new Map(); // chave(email|ip) -> {fails, until}
+function _loginChave(req, email){ const xf=String(req.headers['x-forwarded-for']||'').split(',')[0].trim(); const ip=xf||(req.socket&&req.socket.remoteAddress)||''; return String(email||'')+'|'+ip; }
+function _loginBloqueado(k){ const r=_loginTent.get(k); if(r&&r.until&&Date.now()<r.until) return Math.ceil((r.until-Date.now())/60000); return 0; }
+function _loginFalhou(k){ const r=_loginTent.get(k)||{fails:0,until:0}; r.fails=(r.fails||0)+1; if(r.fails>=5){ r.until=Date.now()+15*60*1000; r.fails=0; } _loginTent.set(k,r); }
+function _loginOk(k){ _loginTent.delete(k); }
+
 // ── Armazenamento de ficheiros na nuvem (Cloudflare R2, opcional) ───────────
 // Se as 5 variaveis R2_* estiverem definidas, os comprovativos vao para o R2.
 // Caso contrario, ficam guardados no proprio servidor (tabela files) — que ja
@@ -316,6 +325,7 @@ const server = http.createServer(async (req, res) => {
       const email = String(b.email || '').trim().toLowerCase();
       const pass = String(b.password || '');
       if (!email || !pass) return send(res, 400, { error: 'Indique email e palavra-passe' });
+      if (senhaFraca(pass)) return send(res, 400, { error: REGRA_SENHA });
       if (Q.userByEmail.get(email)) return send(res, 409, { error: 'Já existe uma conta com esse email. Use Entrar.' });
       const tid = newId('t_');
       Q.insTenant.run(tid, email.split('@')[0] + ' (empresa)', now());
@@ -331,8 +341,12 @@ const server = http.createServer(async (req, res) => {
       const b = await readBody(req);
       const email = String(b.email || '').trim().toLowerCase();
       const pass = String(b.password || '');
+      const chave = _loginChave(req, email);
+      const espera = _loginBloqueado(chave);
+      if (espera) return send(res, 429, { error: 'Demasiadas tentativas falhadas. Tente novamente dentro de ' + espera + ' min.' });
       const user = Q.userByEmail.get(email);
-      if (!user || Number(user.ativo) === 0 || !verifyPassword(pass, user.pass_hash)) return send(res, 401, { error: 'Email ou palavra-passe incorrectos' });
+      if (!user || Number(user.ativo) === 0 || !verifyPassword(pass, user.pass_hash)) { _loginFalhou(chave); return send(res, 401, { error: 'Email ou palavra-passe incorrectos' }); }
+      _loginOk(chave);
       return send(res, 200, { token: tokenForUser(user), nome: user.nome, role: user.role, email: user.email });
     }
 
@@ -341,7 +355,7 @@ const server = http.createServer(async (req, res) => {
       const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
       const b = await readBody(req);
       if (!verifyPassword(String(b.currentPassword || ''), me.pass_hash)) return send(res, 400, { error: 'Palavra-passe actual incorrecta' });
-      if (String(b.newPassword || '').length < 3) return send(res, 400, { error: 'Nova palavra-passe demasiado curta' });
+      if (senhaFraca(b.newPassword)) return send(res, 400, { error: REGRA_SENHA });
       Q.updUserPass.run(hashPassword(String(b.newPassword)), me.id);
       return send(res, 200, { ok: true });
     }
@@ -436,6 +450,7 @@ const server = http.createServer(async (req, res) => {
       const email = String(b.email || '').trim().toLowerCase();
       const pass = String(b.password || '');
       if (!email || !pass) return send(res, 400, { error: 'Email e palavra-passe obrigatórios' });
+      if (senhaFraca(pass)) return send(res, 400, { error: REGRA_SENHA });
       if (Q.userByEmail.get(email)) return send(res, 409, { error: 'Email já existe' });
       Q.insUser.run(newId('u_'), me.tenant_id, email, hashPassword(pass), String(b.nome || email.split('@')[0]), String(b.role || 'Comercial'), now());
       return send(res, 200, { ok: true });
