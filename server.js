@@ -14,10 +14,10 @@
 
 'use strict';
 const http = require('http');
+const https = require('https');
 const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
-const https = require('https');
 const { DatabaseSync } = require('node:sqlite');
 
 // ── Configuração (variáveis de ambiente) ───────────────────────────────────
@@ -25,18 +25,6 @@ const PORT = process.env.PORT || 3000;
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data'); // monte um volume persistente aqui
 const AUTH_SECRET = process.env.AUTH_SECRET || 'troque-este-segredo-em-producao';
 const TOKEN_TTL_DAYS = Number(process.env.TOKEN_TTL_DAYS || 30);
-// Recuperação de palavra-passe por email (Resend — API HTTP, sem dependências)
-const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
-const MAIL_FROM = process.env.MAIL_FROM || 'AMDP <onboarding@resend.dev>';
-const RESET_TTL_MIN = Number(process.env.RESET_TTL_MIN || 15);
-const APP_NAME = process.env.APP_NAME || 'AMDP';
-// Armazenamento de ficheiros — Cloudflare R2 (S3), sem dependências
-const R2_ENDPOINT = (process.env.R2_ENDPOINT || '').replace(/\/$/, '');   // https://<acct>.r2.cloudflarestorage.com
-const R2_BUCKET = process.env.R2_BUCKET || '';
-const R2_ACCESS_KEY = process.env.R2_ACCESS_KEY || '';
-const R2_SECRET = process.env.R2_SECRET || '';
-const R2_PUBLIC_URL = (process.env.R2_PUBLIC_URL || '').replace(/\/$/, ''); // https://pub-xxxx.r2.dev
-const R2_OK = !!(R2_ENDPOINT && R2_BUCKET && R2_ACCESS_KEY && R2_SECRET && R2_PUBLIC_URL);
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 const db = new DatabaseSync(path.join(DATA_DIR, 'amdp.db'));
@@ -92,17 +80,15 @@ CREATE TABLE IF NOT EXISTS fiscal_seq (
   seq       INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (tenant_id, chave)
 );
-CREATE TABLE IF NOT EXISTS pw_resets (
-  email     TEXT PRIMARY KEY,
-  code_hash TEXT NOT NULL,
-  expires   INTEGER NOT NULL,
-  attempts  INTEGER NOT NULL DEFAULT 0,
-  criado_em TEXT
+CREATE TABLE IF NOT EXISTS files (
+  id         TEXT PRIMARY KEY,
+  tenant_id  TEXT NOT NULL,
+  nome       TEXT,
+  tipo       TEXT,
+  dados      BLOB,
+  criado_em  TEXT
 );
 `);
-
-// migração idempotente: áreas de negócio por utilizador
-try { db.exec("ALTER TABLE users ADD COLUMN areas TEXT DEFAULT '[]'"); } catch (e) {}
 
 // ── Utilitários: palavra-passe (scrypt) e token (HMAC) ──────────────────────
 function hashPassword(pw) {
@@ -139,36 +125,74 @@ function verifyToken(token) {
 function newId(pfx) { return (pfx || '') + crypto.randomBytes(9).toString('hex'); }
 function now() { return new Date().toISOString(); }
 function isAdmin(role) { return /^admin/i.test(String(role || '')); }
-function _areasArr(v){ try{ var a=JSON.parse(v||'[]'); return Array.isArray(a)?a:[]; }catch(e){ return []; } }
-function _areasStr(v){ try{ if(Array.isArray(v)) return JSON.stringify(v.filter(Boolean)); if(typeof v==='string'){ var t=v.trim(); return t.charAt(0)==='['?t:JSON.stringify(t.split(',').map(function(x){return x.trim();}).filter(Boolean)); } return '[]'; }catch(e){ return '[]'; } }
 
-// ── Recuperação de palavra-passe: código + envio de email ───────────────────
-function hashCode(email, code) {
-  return crypto.createHmac('sha256', AUTH_SECRET).update(String(email).toLowerCase() + ':' + String(code)).digest('hex');
-}
-const _forgotRate = new Map(); // email -> timestamp do último pedido
-function sendEmail(to, subject, html) {
-  return new Promise((resolve) => {
-    if (!RESEND_API_KEY) { console.warn('[email] RESEND_API_KEY em falta — email NAO enviado para ' + to); return resolve(false); }
-    const payload = JSON.stringify({ from: MAIL_FROM, to: [to], subject: subject, html: html });
-    const rq = https.request({
-      hostname: 'api.resend.com', path: '/emails', method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + RESEND_API_KEY, 'Content-Length': Buffer.byteLength(payload) }
-    }, (resp) => { let d = ''; resp.on('data', c => d += c); resp.on('end', () => { const ok = resp.statusCode >= 200 && resp.statusCode < 300; if (!ok) console.error('[email] falhou ' + resp.statusCode + ' ' + d.slice(0, 200)); resolve(ok); }); });
-    rq.on('error', (e) => { console.error('[email] erro: ' + e.message); resolve(false); });
-    rq.write(payload); rq.end();
+// ── Armazenamento de ficheiros na nuvem (Cloudflare R2, opcional) ───────────
+// Se as 5 variaveis R2_* estiverem definidas, os comprovativos vao para o R2.
+// Caso contrario, ficam guardados no proprio servidor (tabela files) — que ja
+// e "a nuvem" do ponto de vista do utilizador (acessivel em qualquer aparelho).
+const R2 = {
+  account:    process.env.R2_ACCOUNT_ID || '',
+  bucket:     process.env.R2_BUCKET || '',
+  accessKey:  process.env.R2_ACCESS_KEY_ID || '',
+  secretKey:  process.env.R2_SECRET_ACCESS_KEY || '',
+  publicBase: String(process.env.R2_PUBLIC_BASE || '').replace(/\/+$/, '')
+};
+function r2Ativo() { return !!(R2.account && R2.bucket && R2.accessKey && R2.secretKey && R2.publicBase); }
+function _sha256hex(buf) { return crypto.createHash('sha256').update(buf).digest('hex'); }
+function _hmac(key, str) { return crypto.createHmac('sha256', key).update(str, 'utf8').digest(); }
+function r2Put(objKey, buf, contentType) {
+  return new Promise((resolve, reject) => {
+    try {
+      const host = R2.account + '.r2.cloudflarestorage.com';
+      const region = 'auto', service = 's3';
+      const amzDate = new Date().toISOString().replace(/[:-]|\.\d{3}/g, ''); // YYYYMMDDTHHMMSSZ
+      const dateStamp = amzDate.slice(0, 8);
+      const canonicalUri = '/' + R2.bucket + '/' + objKey.split('/').map(encodeURIComponent).join('/');
+      const payloadHash = _sha256hex(buf);
+      const canonicalHeaders = 'host:' + host + '\n' + 'x-amz-content-sha256:' + payloadHash + '\n' + 'x-amz-date:' + amzDate + '\n';
+      const signedHeaders = 'host;x-amz-content-sha256;x-amz-date';
+      const canonicalRequest = 'PUT\n' + canonicalUri + '\n\n' + canonicalHeaders + '\n' + signedHeaders + '\n' + payloadHash;
+      const scope = dateStamp + '/' + region + '/' + service + '/aws4_request';
+      const stringToSign = 'AWS4-HMAC-SHA256\n' + amzDate + '\n' + scope + '\n' + _sha256hex(Buffer.from(canonicalRequest, 'utf8'));
+      const kDate = _hmac('AWS4' + R2.secretKey, dateStamp);
+      const kRegion = _hmac(kDate, region);
+      const kService = _hmac(kRegion, service);
+      const kSigning = _hmac(kService, 'aws4_request');
+      const signature = crypto.createHmac('sha256', kSigning).update(stringToSign, 'utf8').digest('hex');
+      const authorization = 'AWS4-HMAC-SHA256 Credential=' + R2.accessKey + '/' + scope +
+        ', SignedHeaders=' + signedHeaders + ', Signature=' + signature;
+      const rq = https.request({
+        host: host, method: 'PUT', path: canonicalUri,
+        headers: {
+          'Authorization': authorization,
+          'x-amz-content-sha256': payloadHash,
+          'x-amz-date': amzDate,
+          'Content-Type': contentType || 'application/octet-stream',
+          'Content-Length': buf.length
+        }
+      }, (r) => {
+        let d = ''; r.on('data', c => d += c);
+        r.on('end', () => { (r.statusCode >= 200 && r.statusCode < 300) ? resolve(R2.publicBase + '/' + objKey) : reject('R2 ' + r.statusCode + ' ' + d.slice(0, 200)); });
+      });
+      rq.on('error', reject); rq.write(buf); rq.end();
+    } catch (e) { reject(e); }
   });
+}
+function _baseUrl(req) {
+  const proto = (req.headers['x-forwarded-proto'] || 'https').split(',')[0].trim();
+  const host = req.headers['host'] || 'localhost';
+  return proto + '://' + host;
 }
 
 // ── Acesso a dados (statements preparados) ──────────────────────────────────
 const Q = {
   userByEmail: db.prepare('SELECT * FROM users WHERE lower(email)=lower(?)'),
   userById: db.prepare('SELECT * FROM users WHERE id=?'),
-  usersByTenant: db.prepare('SELECT id,email,nome,role,areas,ativo FROM users WHERE tenant_id=? ORDER BY criado_em'),
+  usersByTenant: db.prepare('SELECT id,email,nome,role,ativo FROM users WHERE tenant_id=? ORDER BY criado_em'),
   insTenant: db.prepare('INSERT INTO tenants(id,nome,ver,criado_em) VALUES(?,?,0,?)'),
-  insUser: db.prepare('INSERT INTO users(id,tenant_id,email,pass_hash,nome,role,areas,ativo,criado_em) VALUES(?,?,?,?,?,?,?,1,?)'),
+  insUser: db.prepare('INSERT INTO users(id,tenant_id,email,pass_hash,nome,role,ativo,criado_em) VALUES(?,?,?,?,?,?,1,?)'),
   updUserPass: db.prepare('UPDATE users SET pass_hash=? WHERE id=?'),
-  updUser: db.prepare('UPDATE users SET nome=?, role=?, areas=? WHERE id=? AND tenant_id=?'),
+  updUser: db.prepare('UPDATE users SET nome=?, role=? WHERE id=? AND tenant_id=?'),
   delUser: db.prepare('DELETE FROM users WHERE id=? AND tenant_id=?'),
   tenantVer: db.prepare('SELECT ver FROM tenants WHERE id=?'),
   bumpTenant: db.prepare('UPDATE tenants SET ver=? WHERE id=?'),
@@ -183,10 +207,8 @@ const Q = {
   auditByTenant: db.prepare('SELECT autor,op,tabela,registo_id AS registoId,ts FROM auditoria WHERE tenant_id=? ORDER BY id DESC LIMIT 500'),
   fiscalGet: db.prepare('SELECT seq FROM fiscal_seq WHERE tenant_id=? AND chave=?'),
   fiscalSet: db.prepare('INSERT INTO fiscal_seq(tenant_id,chave,seq) VALUES(?,?,?) ON CONFLICT(tenant_id,chave) DO UPDATE SET seq=excluded.seq'),
-  resetGet: db.prepare('SELECT * FROM pw_resets WHERE email=?'),
-  resetSet: db.prepare('INSERT INTO pw_resets(email,code_hash,expires,attempts,criado_em) VALUES(?,?,?,0,?) ON CONFLICT(email) DO UPDATE SET code_hash=excluded.code_hash, expires=excluded.expires, attempts=0, criado_em=excluded.criado_em'),
-  resetDel: db.prepare('DELETE FROM pw_resets WHERE email=?'),
-  resetBump: db.prepare('UPDATE pw_resets SET attempts=attempts+1 WHERE email=?'),
+  insFile: db.prepare('INSERT INTO files(id,tenant_id,nome,tipo,dados,criado_em) VALUES(?,?,?,?,?,?)'),
+  getFile: db.prepare('SELECT nome,tipo,dados FROM files WHERE id=?'),
 };
 
 // Transação simples (node:sqlite não tem helper próprio).
@@ -270,39 +292,6 @@ function tokenForUser(u) {
   return signToken({ uid: u.id, tid: u.tenant_id, role: u.role, exp: Date.now() + TOKEN_TTL_DAYS * 864e5 });
 }
 
-// ── Cloudflare R2 (upload S3 com assinatura SigV4, sem dependências) ─────────
-function _hmac(key, data) { return crypto.createHmac('sha256', key).update(data, 'utf8').digest(); }
-function _sha256hex(buf) { return crypto.createHash('sha256').update(buf).digest('hex'); }
-function r2Put(key, buf, contentType) {
-  return new Promise((resolve, reject) => {
-    try {
-      const host = R2_ENDPOINT.replace(/^https?:\/\//, '');
-      const canonicalUri = '/' + R2_BUCKET + '/' + key.split('/').map(encodeURIComponent).join('/');
-      const amzdate = new Date().toISOString().replace(/[:-]|\.\d{3}/g, '');
-      const datestamp = amzdate.slice(0, 8);
-      const region = 'auto', service = 's3';
-      const payloadHash = _sha256hex(buf);
-      const ct = contentType || 'application/octet-stream';
-      const canonicalHeaders = 'content-type:' + ct + '\nhost:' + host + '\nx-amz-content-sha256:' + payloadHash + '\nx-amz-date:' + amzdate + '\n';
-      const signedHeaders = 'content-type;host;x-amz-content-sha256;x-amz-date';
-      const canonicalRequest = ['PUT', canonicalUri, '', canonicalHeaders, signedHeaders, payloadHash].join('\n');
-      const scope = datestamp + '/' + region + '/' + service + '/aws4_request';
-      const stringToSign = ['AWS4-HMAC-SHA256', amzdate, scope, _sha256hex(Buffer.from(canonicalRequest, 'utf8'))].join('\n');
-      const kSigning = _hmac(_hmac(_hmac(_hmac('AWS4' + R2_SECRET, datestamp), region), service), 'aws4_request');
-      const signature = crypto.createHmac('sha256', kSigning).update(stringToSign, 'utf8').digest('hex');
-      const authorization = 'AWS4-HMAC-SHA256 Credential=' + R2_ACCESS_KEY + '/' + scope + ', SignedHeaders=' + signedHeaders + ', Signature=' + signature;
-      const rq = https.request({
-        method: 'PUT', host: host, path: canonicalUri,
-        headers: { 'Host': host, 'Content-Type': ct, 'Content-Length': buf.length, 'x-amz-content-sha256': payloadHash, 'x-amz-date': amzdate, 'Authorization': authorization }
-      }, (rs) => {
-        let body = ''; rs.on('data', c => body += c);
-        rs.on('end', () => { (rs.statusCode >= 200 && rs.statusCode < 300) ? resolve(true) : reject(new Error('R2 ' + rs.statusCode + ' ' + body.slice(0, 300))); });
-      });
-      rq.on('error', reject); rq.write(buf); rq.end();
-    } catch (e) { reject(e); }
-  });
-}
-
 // ── Servidor ────────────────────────────────────────────────────────────────
 const server = http.createServer(async (req, res) => {
   cors(res);
@@ -311,27 +300,7 @@ const server = http.createServer(async (req, res) => {
   const p = u.pathname;
   try {
     // — Saúde —
-    if (p === '/' || p === '/api/health') return send(res, 200, { ok: true, servico: 'AMDP sync', versao: 'areas-v2', areasNoServidor: true, r2: R2_OK, tempo: now() });
-
-    // — Upload de ficheiros para o R2 —
-    if (p === '/api/files' && req.method === 'POST') {
-      const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
-      if (!R2_OK) return send(res, 500, { error: 'Armazenamento de ficheiros não configurado no servidor' });
-      const b = await readBody(req);
-      let data = String(b.dataBase64 || b.data || '');
-      let ctype = String(b.type || '');
-      const mm = data.match(/^data:([^;]+);base64,(.*)$/);
-      if (mm) { ctype = ctype || mm[1]; data = mm[2]; }
-      if (!data) return send(res, 400, { error: 'Sem ficheiro' });
-      let buf; try { buf = Buffer.from(data, 'base64'); } catch (e) { return send(res, 400, { error: 'Ficheiro inválido' }); }
-      if (!buf.length) return send(res, 400, { error: 'Ficheiro vazio' });
-      const nome = String(b.name || 'ficheiro');
-      const ext = (nome.split('.').pop() || '').replace(/[^a-zA-Z0-9]/g, '').slice(0, 8).toLowerCase() || 'bin';
-      const key = me.tenant_id + '/' + newId('f_') + '_' + Date.now() + '.' + ext;
-      try { await r2Put(key, buf, ctype || 'application/octet-stream'); }
-      catch (e) { return send(res, 502, { error: 'Falha ao guardar no R2: ' + (e && e.message || e) }); }
-      return send(res, 200, { ok: true, url: R2_PUBLIC_URL + '/' + key, key: key, size: buf.length });
-    }
+    if (p === '/' || p === '/api/health') return send(res, 200, { ok: true, servico: 'AMDP sync', tempo: now() });
 
     // — Registo (cria empresa + administrador) —
     if (p === '/api/auth/register' && req.method === 'POST') {
@@ -344,9 +313,9 @@ const server = http.createServer(async (req, res) => {
       Q.insTenant.run(tid, email.split('@')[0] + ' (empresa)', now());
       const uid = newId('u_');
       const nome = email.split('@')[0];
-      Q.insUser.run(uid, tid, email, hashPassword(pass), nome, 'Administrador', '[]', now());
+      Q.insUser.run(uid, tid, email, hashPassword(pass), nome, 'Administrador', now());
       const user = Q.userById.get(uid);
-      return send(res, 200, { token: tokenForUser(user), nome: user.nome, role: user.role, email: user.email, areas: _areasArr(user.areas) });
+      return send(res, 200, { token: tokenForUser(user), nome: user.nome, role: user.role, email: user.email });
     }
 
     // — Entrar —
@@ -356,7 +325,7 @@ const server = http.createServer(async (req, res) => {
       const pass = String(b.password || '');
       const user = Q.userByEmail.get(email);
       if (!user || Number(user.ativo) === 0 || !verifyPassword(pass, user.pass_hash)) return send(res, 401, { error: 'Email ou palavra-passe incorrectos' });
-      return send(res, 200, { token: tokenForUser(user), nome: user.nome, role: user.role, email: user.email, areas: _areasArr(user.areas) });
+      return send(res, 200, { token: tokenForUser(user), nome: user.nome, role: user.role, email: user.email });
     }
 
     // — Trocar a própria palavra-passe —
@@ -450,7 +419,7 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/users' && req.method === 'GET') {
       const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
       if (!isAdmin(me.role)) return send(res, 403, { error: 'Apenas o Administrador' });
-      return send(res, 200, { users: Q.usersByTenant.all(me.tenant_id).map(x => ({ id: x.id, email: x.email, nome: x.nome, role: x.role, ativo: Number(x.ativo) !== 0, areas: _areasArr(x.areas) })) });
+      return send(res, 200, { users: Q.usersByTenant.all(me.tenant_id).map(x => ({ id: x.id, email: x.email, nome: x.nome, role: x.role, ativo: Number(x.ativo) !== 0 })) });
     }
     if (p === '/api/users/create' && req.method === 'POST') {
       const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
@@ -460,7 +429,7 @@ const server = http.createServer(async (req, res) => {
       const pass = String(b.password || '');
       if (!email || !pass) return send(res, 400, { error: 'Email e palavra-passe obrigatórios' });
       if (Q.userByEmail.get(email)) return send(res, 409, { error: 'Email já existe' });
-      Q.insUser.run(newId('u_'), me.tenant_id, email, hashPassword(pass), String(b.nome || email.split('@')[0]), String(b.role || 'Comercial'), _areasStr(b.areas), now());
+      Q.insUser.run(newId('u_'), me.tenant_id, email, hashPassword(pass), String(b.nome || email.split('@')[0]), String(b.role || 'Comercial'), now());
       return send(res, 200, { ok: true });
     }
     if (p === '/api/users/update' && req.method === 'POST') {
@@ -469,7 +438,7 @@ const server = http.createServer(async (req, res) => {
       const b = await readBody(req);
       const target = Q.userById.get(String(b.id || ''));
       if (!target || target.tenant_id !== me.tenant_id) return send(res, 404, { error: 'Conta não encontrada' });
-      Q.updUser.run(String(b.nome || target.nome), String(b.role || target.role), (b.areas !== undefined ? _areasStr(b.areas) : (target.areas || '[]')), target.id, me.tenant_id);
+      Q.updUser.run(String(b.nome || target.nome), String(b.role || target.role), target.id, me.tenant_id);
       if (b.password) Q.updUserPass.run(hashPassword(String(b.password)), target.id);
       return send(res, 200, { ok: true });
     }
@@ -500,51 +469,38 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { movimentos: Q.auditByTenant.all(me.tenant_id) });
     }
 
-    // — Recuperação: pedir código por email —
-    if (p === '/api/auth/forgot' && req.method === 'POST') {
+    // — Ficheiros / comprovativos na nuvem —
+    if (p === '/api/files' && req.method === 'POST') {
+      const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
       const b = await readBody(req);
-      const email = String(b.email || '').trim().toLowerCase();
-      const generic = () => send(res, 200, { ok: true }); // resposta genérica (não revela se a conta existe)
-      if (!email) return generic();
-      const last = _forgotRate.get(email) || 0;
-      if (Date.now() - last < 60000) return generic();     // 1 pedido / 60s por email
-      _forgotRate.set(email, Date.now());
-      const user = Q.userByEmail.get(email);
-      if (user && Number(user.ativo) !== 0) {
-        const code = String(Math.floor(100000 + Math.random() * 900000)); // 6 digitos
-        Q.resetSet.run(email, hashCode(email, code), Date.now() + RESET_TTL_MIN * 60000, now());
-        const html = '<div style="font-family:Arial,Helvetica,sans-serif;max-width:480px;margin:auto;color:#0a2540">'
-          + '<h2 style="margin:0 0 8px">' + APP_NAME + ' - Recuperacao de palavra-passe</h2>'
-          + '<p>Recebemos um pedido para repor a palavra-passe da sua conta.</p>'
-          + '<p>O seu codigo de recuperacao e:</p>'
-          + '<p style="font-size:30px;font-weight:bold;letter-spacing:6px">' + code + '</p>'
-          + '<p>Este codigo expira em ' + RESET_TTL_MIN + ' minutos. Se nao foi voce a pedir, ignore este email.</p>'
-          + '</div>';
-        sendEmail(email, APP_NAME + ' - Codigo de recuperacao', html); // não aguardamos (resposta imediata e genérica)
+      const raw = String(b.dataBase64 || b.data || '');
+      const mm = raw.match(/^data:([^;,]*)(;base64)?,(.*)$/);
+      const ctype = (mm && mm[1]) || String(b.type || 'application/octet-stream');
+      const b64 = mm ? mm[3] : raw;
+      let buf; try { buf = Buffer.from(b64, 'base64'); } catch (e) { return send(res, 400, { error: 'Ficheiro inválido' }); }
+      if (!buf || !buf.length) return send(res, 400, { error: 'Ficheiro vazio' });
+      if (buf.length > 20 * 1024 * 1024) return send(res, 413, { error: 'Ficheiro demasiado grande (máx. 20 MB)' });
+      const id = newId('f_');
+      if (r2Ativo()) {
+        try { const url = await r2Put(me.tenant_id + '/' + id, buf, ctype); return send(res, 200, { url: url, id: id, store: 'r2' }); }
+        catch (e) { console.warn('[R2] falhou, a guardar no servidor:', e && e.message ? e.message : e); }
       }
-      return generic();
+      try { Q.insFile.run(id, me.tenant_id, String(b.name || 'ficheiro').slice(0, 200), ctype, buf, now()); }
+      catch (e) { return send(res, 500, { error: 'Não foi possível guardar o ficheiro' }); }
+      return send(res, 200, { url: _baseUrl(req) + '/api/files/' + id, id: id, store: 'db' });
     }
-
-    // — Recuperação: definir nova palavra-passe com o código —
-    if (p === '/api/auth/reset' && req.method === 'POST') {
-      const b = await readBody(req);
-      const email = String(b.email || '').trim().toLowerCase();
-      const code = String(b.code || '').trim();
-      const np = String(b.newPassword || '');
-      if (!email || !code || !np) return send(res, 400, { error: 'Dados incompletos' });
-      if (np.length < 3) return send(res, 400, { error: 'Nova palavra-passe demasiado curta' });
-      const row = Q.resetGet.get(email);
-      if (!row) return send(res, 400, { error: 'Codigo invalido ou expirado' });
-      if (Date.now() > Number(row.expires)) { Q.resetDel.run(email); return send(res, 400, { error: 'Codigo expirado. Peca um novo.' }); }
-      if (Number(row.attempts) >= 5) { Q.resetDel.run(email); return send(res, 400, { error: 'Demasiadas tentativas. Peca um novo codigo.' }); }
-      const a = Buffer.from(String(row.code_hash)); const bb = Buffer.from(hashCode(email, code));
-      const good = a.length === bb.length && crypto.timingSafeEqual(a, bb);
-      if (!good) { Q.resetBump.run(email); return send(res, 400, { error: 'Codigo invalido' }); }
-      const user = Q.userByEmail.get(email);
-      if (!user) { Q.resetDel.run(email); return send(res, 400, { error: 'Conta nao encontrada' }); }
-      Q.updUserPass.run(hashPassword(np), user.id);
-      Q.resetDel.run(email);
-      return send(res, 200, { ok: true });
+    if (p.startsWith('/api/files/') && req.method === 'GET') {
+      const id = decodeURIComponent(p.slice('/api/files/'.length));
+      const row = id && Q.getFile.get(id);
+      if (!row) return send(res, 404, { error: 'Ficheiro não encontrado' });
+      const buf = Buffer.from(row.dados);
+      res.writeHead(200, {
+        'Content-Type': row.tipo || 'application/octet-stream',
+        'Content-Disposition': 'inline; filename="' + String(row.nome || 'ficheiro').replace(/["\r\n]/g, '') + '"',
+        'Content-Length': buf.length,
+        'Cache-Control': 'private, max-age=31536000'
+      });
+      return res.end(buf);
     }
 
     return send(res, 404, { error: 'Endpoint não encontrado' });
