@@ -268,7 +268,7 @@ function send(res, code, obj) {
 function cors(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-File-Name');
   res.setHeader('Access-Control-Max-Age', '86400');
 }
 function readBody(req) {
@@ -276,6 +276,14 @@ function readBody(req) {
     let d = ''; req.on('data', c => { d += c; if (d.length > 25 * 1024 * 1024) req.destroy(); });
     req.on('end', () => { try { resolve(d ? JSON.parse(d) : {}); } catch (e) { resolve({}); } });
     req.on('error', () => resolve({}));
+  });
+}
+function readRaw(req, maxBytes) {
+  return new Promise((resolve, reject) => {
+    const chunks = []; let total = 0; const lim = maxBytes || 30 * 1024 * 1024;
+    req.on('data', c => { total += c.length; if (total > lim) { req.destroy(); reject(new Error('too-large')); return; } chunks.push(c); });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
   });
 }
 function urlOf(req) { return new URL(req.url, 'http://localhost'); }
@@ -472,20 +480,32 @@ const server = http.createServer(async (req, res) => {
     // — Ficheiros / comprovativos na nuvem —
     if (p === '/api/files' && req.method === 'POST') {
       const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
-      const b = await readBody(req);
-      const raw = String(b.dataBase64 || b.data || '');
-      const mm = raw.match(/^data:([^;,]*)(;base64)?,(.*)$/);
-      const ctype = (mm && mm[1]) || String(b.type || 'application/octet-stream');
-      const b64 = mm ? mm[3] : raw;
-      let buf; try { buf = Buffer.from(b64, 'base64'); } catch (e) { return send(res, 400, { error: 'Ficheiro inválido' }); }
+      const MAX = 30 * 1024 * 1024; // 30 MB
+      const cthdr = String(req.headers['content-type'] || '');
+      let buf, ctype, nome;
+      if (cthdr.indexOf('application/json') === 0) {
+        // Modo antigo: JSON com dataBase64 (imagens pequenas)
+        const b = await readBody(req);
+        const raw = String(b.dataBase64 || b.data || '');
+        const mm = raw.match(/^data:([^;,]*)(;base64)?,(.*)$/);
+        ctype = (mm && mm[1]) || String(b.type || 'application/octet-stream');
+        try { buf = Buffer.from(mm ? mm[3] : raw, 'base64'); } catch (e) { return send(res, 400, { error: 'Ficheiro inválido' }); }
+        nome = String(b.name || 'ficheiro');
+      } else {
+        // Modo binário: o corpo do pedido É o ficheiro (sem base64) — ideal para PDFs grandes
+        try { buf = await readRaw(req, MAX); }
+        catch (e) { return send(res, 413, { error: 'Ficheiro demasiado grande (máx. 30 MB)' }); }
+        ctype = cthdr || 'application/octet-stream';
+        try { nome = decodeURIComponent(String(req.headers['x-file-name'] || 'ficheiro')); } catch (e) { nome = 'ficheiro'; }
+      }
       if (!buf || !buf.length) return send(res, 400, { error: 'Ficheiro vazio' });
-      if (buf.length > 20 * 1024 * 1024) return send(res, 413, { error: 'Ficheiro demasiado grande (máx. 20 MB)' });
+      if (buf.length > MAX) return send(res, 413, { error: 'Ficheiro demasiado grande (máx. 30 MB)' });
       const id = newId('f_');
       if (r2Ativo()) {
         try { const url = await r2Put(me.tenant_id + '/' + id, buf, ctype); return send(res, 200, { url: url, id: id, store: 'r2' }); }
         catch (e) { console.warn('[R2] falhou, a guardar no servidor:', e && e.message ? e.message : e); }
       }
-      try { Q.insFile.run(id, me.tenant_id, String(b.name || 'ficheiro').slice(0, 200), ctype, buf, now()); }
+      try { Q.insFile.run(id, me.tenant_id, String(nome || 'ficheiro').slice(0, 200), ctype, buf, now()); }
       catch (e) { return send(res, 500, { error: 'Não foi possível guardar o ficheiro' }); }
       return send(res, 200, { url: _baseUrl(req) + '/api/files/' + id, id: id, store: 'db' });
     }
