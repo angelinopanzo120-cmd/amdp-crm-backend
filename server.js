@@ -92,6 +92,10 @@ CREATE TABLE IF NOT EXISTS files (
 );
 `);
 
+// ── Migrações leves (colunas novas em instalações já existentes) ────────────
+try { db.exec("ALTER TABLE users ADD COLUMN last_login TEXT"); } catch (e) {}
+try { db.exec("ALTER TABLE users ADD COLUMN sess_ver INTEGER NOT NULL DEFAULT 0"); } catch (e) {}
+
 // ── Utilitários: palavra-passe (scrypt) e token (HMAC) ──────────────────────
 function hashPassword(pw) {
   const salt = crypto.randomBytes(16);
@@ -215,7 +219,9 @@ function _baseUrl(req) {
 const Q = {
   userByEmail: db.prepare('SELECT * FROM users WHERE lower(email)=lower(?)'),
   userById: db.prepare('SELECT * FROM users WHERE id=?'),
-  usersByTenant: db.prepare('SELECT id,email,nome,role,ativo FROM users WHERE tenant_id=? ORDER BY criado_em'),
+  usersByTenant: db.prepare('SELECT id,email,nome,role,ativo,last_login FROM users WHERE tenant_id=? ORDER BY criado_em'),
+  setLastLogin: db.prepare('UPDATE users SET last_login=? WHERE id=?'),
+  bumpSess: db.prepare('UPDATE users SET sess_ver=COALESCE(sess_ver,0)+1 WHERE id=? AND tenant_id=?'),
   insTenant: db.prepare('INSERT INTO tenants(id,nome,ver,criado_em) VALUES(?,?,0,?)'),
   insUser: db.prepare('INSERT INTO users(id,tenant_id,email,pass_hash,nome,role,ativo,criado_em) VALUES(?,?,?,?,?,?,1,?)'),
   updUserPass: db.prepare('UPDATE users SET pass_hash=? WHERE id=?'),
@@ -321,10 +327,11 @@ function auth(req) {
   if (!p) return null;
   const u = Q.userById.get(p.uid);
   if (!u || Number(u.ativo) === 0) return null;
+  if (Number(p.sv || 0) !== Number(u.sess_ver || 0)) return null; // sessão terminada pelo administrador / palavra-passe alterada
   return u; // {id,tenant_id,email,nome,role,...}
 }
 function tokenForUser(u) {
-  return signToken({ uid: u.id, tid: u.tenant_id, role: u.role, exp: Date.now() + TOKEN_TTL_DAYS * 864e5 });
+  return signToken({ uid: u.id, tid: u.tenant_id, role: u.role, sv: Number(u.sess_ver || 0), exp: Date.now() + TOKEN_TTL_DAYS * 864e5 });
 }
 
 // ── Servidor ────────────────────────────────────────────────────────────────
@@ -365,6 +372,7 @@ const server = http.createServer(async (req, res) => {
       const user = Q.userByEmail.get(email);
       if (!user || Number(user.ativo) === 0 || !verifyPassword(pass, user.pass_hash)) { _loginFalhou(chave); return send(res, 401, { error: 'Email ou palavra-passe incorrectos' }); }
       _loginOk(chave);
+      try { Q.setLastLogin.run(now(), user.id); } catch (e) {}
       return send(res, 200, { token: tokenForUser(user), nome: user.nome, role: user.role, email: user.email });
     }
 
@@ -459,7 +467,7 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/users' && req.method === 'GET') {
       const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
       if (!isAdmin(me.role)) return send(res, 403, { error: 'Apenas o Administrador' });
-      return send(res, 200, { users: Q.usersByTenant.all(me.tenant_id).map(x => ({ id: x.id, email: x.email, nome: x.nome, role: x.role, ativo: Number(x.ativo) !== 0 })) });
+      return send(res, 200, { users: Q.usersByTenant.all(me.tenant_id).map(x => ({ id: x.id, email: x.email, nome: x.nome, role: x.role, ativo: Number(x.ativo) !== 0, last_login: x.last_login || null })) });
     }
     if (p === '/api/users/create' && req.method === 'POST') {
       const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
@@ -480,7 +488,11 @@ const server = http.createServer(async (req, res) => {
       const target = Q.userById.get(String(b.id || ''));
       if (!target || target.tenant_id !== me.tenant_id) return send(res, 404, { error: 'Conta não encontrada' });
       Q.updUser.run(String(b.nome || target.nome), String(b.role || target.role), target.id, me.tenant_id);
-      if (b.password) Q.updUserPass.run(hashPassword(String(b.password)), target.id);
+      if (b.password) {
+        if (senhaFraca(b.password)) return send(res, 400, { error: REGRA_SENHA });
+        Q.updUserPass.run(hashPassword(String(b.password)), target.id);
+        Q.bumpSess.run(target.id, me.tenant_id); // a nova palavra-passe termina as sessões antigas dessa conta
+      }
       return send(res, 200, { ok: true });
     }
     if (p === '/api/users/delete' && req.method === 'POST') {
@@ -547,13 +559,27 @@ const server = http.createServer(async (req, res) => {
       const row = id && Q.getFile.get(id);
       if (!row) return send(res, 404, { error: 'Ficheiro não encontrado' });
       const buf = Buffer.from(row.dados);
+      const _nomeOrig = String(row.nome || 'ficheiro');
+      const _nomeAscii = _nomeOrig.replace(/[^\x20-\x7E]/g, '_').replace(/["\\]/g, '');   // só ASCII no filename clássico
+      const _nomeUtf8 = encodeURIComponent(_nomeOrig);                                        // nome real (RFC 5987)
       res.writeHead(200, {
         'Content-Type': row.tipo || 'application/octet-stream',
-        'Content-Disposition': 'inline; filename="' + String(row.nome || 'ficheiro').replace(/["\r\n]/g, '') + '"',
+        'Content-Disposition': "inline; filename=\"" + _nomeAscii + "\"; filename*=UTF-8''" + _nomeUtf8,
         'Content-Length': buf.length,
         'Cache-Control': 'private, max-age=31536000'
       });
       return res.end(buf);
+    }
+
+    // — Terminar sessão de um utilizador à distância (administrador) —
+    if (p === '/api/users/logout' && req.method === 'POST') {
+      const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
+      if (!isAdmin(me.role)) return send(res, 403, { error: 'Apenas o Administrador' });
+      const b = await readBody(req);
+      const target = Q.userById.get(String(b.id || ''));
+      if (!target || target.tenant_id !== me.tenant_id) return send(res, 404, { error: 'Conta não encontrada' });
+      Q.bumpSess.run(target.id, me.tenant_id);
+      return send(res, 200, { ok: true });
     }
 
     // — Cópias de segurança (administrador) —
