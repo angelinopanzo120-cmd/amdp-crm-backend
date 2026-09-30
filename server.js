@@ -560,14 +560,18 @@ const server = http.createServer(async (req, res) => {
       if (!row) return send(res, 404, { error: 'Ficheiro não encontrado' });
       const buf = Buffer.from(row.dados);
       const _nomeOrig = String(row.nome || 'ficheiro');
-      const _nomeAscii = _nomeOrig.replace(/[^\x20-\x7E]/g, '_').replace(/["\\]/g, '');   // só ASCII no filename clássico
-      const _nomeUtf8 = encodeURIComponent(_nomeOrig);                                        // nome real (RFC 5987)
-      res.writeHead(200, {
-        'Content-Type': row.tipo || 'application/octet-stream',
-        'Content-Disposition': "inline; filename=\"" + _nomeAscii + "\"; filename*=UTF-8''" + _nomeUtf8,
-        'Content-Length': buf.length,
-        'Cache-Control': 'private, max-age=31536000'
-      });
+      // filename clássico: só ASCII imprimível, sem aspas/barra/; — evita "Invalid character in header"
+      let _nomeAscii = _nomeOrig.replace(/[^\x20-\x7E]/g, '_').replace(/["\\;]/g, '').trim();
+      if (!_nomeAscii) _nomeAscii = 'documento';
+      let _cd;
+      try { _cd = "inline; filename=\"" + _nomeAscii + "\"; filename*=UTF-8''" + encodeURIComponent(_nomeOrig); } catch (e) { _cd = 'inline; filename="documento"'; }
+      const _tipo = String(row.tipo || 'application/octet-stream').replace(/[^\x20-\x7E]/g, '') || 'application/octet-stream';
+      try {
+        res.writeHead(200, { 'Content-Type': _tipo, 'Content-Disposition': _cd, 'Content-Length': buf.length, 'Cache-Control': 'private, max-age=31536000' });
+      } catch (e) {
+        // Último recurso: cabeçalho mínimo garantidamente válido
+        res.writeHead(200, { 'Content-Type': _tipo, 'Content-Disposition': 'inline; filename="documento"', 'Content-Length': buf.length });
+      }
       return res.end(buf);
     }
 
