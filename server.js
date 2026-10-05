@@ -23,12 +23,23 @@ const { DatabaseSync } = require('node:sqlite');
 // ── Configuração (variáveis de ambiente) ───────────────────────────────────
 const PORT = process.env.PORT || 3000;
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data'); // monte um volume persistente aqui
-const AUTH_SECRET = process.env.AUTH_SECRET || 'troque-este-segredo-em-producao';
+let AUTH_SECRET = process.env.AUTH_SECRET || '';
+const ALLOW_REGISTER = process.env.ALLOW_REGISTER === '1'; // registo aberto só se =1 (senão só o 1.º arranque)
 const TOKEN_TTL_DAYS = Number(process.env.TOKEN_TTL_DAYS || 30);
 const BACKUP_DIR = path.join(DATA_DIR, 'backups');   // cópias diárias da base de dados
 const BACKUP_KEEP = Number(process.env.BACKUP_KEEP || 14); // quantas manter
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+// Segurança: nunca usar um segredo por omissão conhecido. Se AUTH_SECRET não vier do
+// ambiente, gera-se um segredo forte e guarda-se no volume (persiste entre reinícios).
+if (!AUTH_SECRET || AUTH_SECRET === 'troque-este-segredo-em-producao') {
+  const _sf = path.join(DATA_DIR, '.authsecret');
+  try {
+    if (fs.existsSync(_sf)) AUTH_SECRET = String(fs.readFileSync(_sf, 'utf8')).trim();
+    if (!AUTH_SECRET) { AUTH_SECRET = crypto.randomBytes(48).toString('base64url'); fs.writeFileSync(_sf, AUTH_SECRET, { mode: 0o600 }); }
+    console.warn('[seguranca] AUTH_SECRET não definido nas variáveis — a usar um segredo gerado e guardado em ' + _sf + '. Para controlo total, defina AUTH_SECRET no Railway.');
+  } catch (e) { AUTH_SECRET = crypto.randomBytes(48).toString('base64url'); console.warn('[seguranca] AUTH_SECRET gerado em memória (não foi possível persistir): ' + (e && e.message ? e.message : e)); }
+}
 const db = new DatabaseSync(path.join(DATA_DIR, 'amdp.db'));
 db.exec('PRAGMA journal_mode = WAL;');    // leituras concorrentes + durabilidade
 db.exec('PRAGMA synchronous = NORMAL;');
@@ -223,6 +234,7 @@ const Q = {
   setLastLogin: db.prepare('UPDATE users SET last_login=? WHERE id=?'),
   bumpSess: db.prepare('UPDATE users SET sess_ver=COALESCE(sess_ver,0)+1 WHERE id=? AND tenant_id=?'),
   insTenant: db.prepare('INSERT INTO tenants(id,nome,ver,criado_em) VALUES(?,?,0,?)'),
+  countTenants: db.prepare('SELECT COUNT(*) AS n FROM tenants'),
   insUser: db.prepare('INSERT INTO users(id,tenant_id,email,pass_hash,nome,role,ativo,criado_em) VALUES(?,?,?,?,?,?,1,?)'),
   updUserPass: db.prepare('UPDATE users SET pass_hash=? WHERE id=?'),
   updUser: db.prepare('UPDATE users SET nome=?, role=? WHERE id=? AND tenant_id=?'),
@@ -351,6 +363,9 @@ const server = http.createServer(async (req, res) => {
       const pass = String(b.password || '');
       if (!email || !pass) return send(res, 400, { error: 'Indique email e palavra-passe' });
       if (senhaFraca(pass)) return send(res, 400, { error: REGRA_SENHA });
+      // Segurança: registo só no 1.º arranque (sem empresas) ou se ALLOW_REGISTER=1.
+      let _nT = 1; try { _nT = Q.countTenants.get().n; } catch (e) {}
+      if (!ALLOW_REGISTER && _nT > 0) return send(res, 403, { error: 'Registo fechado. Peça ao Administrador para criar a sua conta.' });
       if (Q.userByEmail.get(email)) return send(res, 409, { error: 'Já existe uma conta com esse email. Use Entrar.' });
       const tid = newId('t_');
       Q.insTenant.run(tid, email.split('@')[0] + ' (empresa)', now());
@@ -614,7 +629,8 @@ const server = http.createServer(async (req, res) => {
 
     return send(res, 404, { error: 'Endpoint não encontrado' });
   } catch (e) {
-    return send(res, 500, { error: 'Erro interno: ' + (e && e.message ? e.message : String(e)) });
+    try { console.error('[erro]', e && e.stack ? e.stack : e); } catch (_) {}
+    return send(res, 500, { error: 'Erro interno do servidor' });
   }
 });
 
