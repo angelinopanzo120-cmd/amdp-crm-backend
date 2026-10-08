@@ -26,6 +26,8 @@ const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data'); // monte 
 let AUTH_SECRET = process.env.AUTH_SECRET || '';
 const ALLOW_REGISTER = process.env.ALLOW_REGISTER === '1'; // registo aberto só se =1 (senão só o 1.º arranque)
 const TOKEN_TTL_DAYS = Number(process.env.TOKEN_TTL_DAYS || 30);
+const RESEND_API_KEY = process.env.RESEND_API_KEY || '';           // chave do Resend (envio de email)
+const MAIL_FROM = process.env.MAIL_FROM || 'AMDP <nao-responder@amdp.ao>';
 const BACKUP_DIR = path.join(DATA_DIR, 'backups');   // cópias diárias da base de dados
 const BACKUP_KEEP = Number(process.env.BACKUP_KEEP || 14); // quantas manter
 
@@ -101,6 +103,13 @@ CREATE TABLE IF NOT EXISTS files (
   dados      BLOB,
   criado_em  TEXT
 );
+CREATE TABLE IF NOT EXISTS pass_reset (
+  user_id    TEXT PRIMARY KEY,
+  code_hash  TEXT,
+  expira     INTEGER,
+  tentativas INTEGER NOT NULL DEFAULT 0,
+  criado     INTEGER
+);
 `);
 
 // ── Migrações leves (colunas novas em instalações já existentes) ────────────
@@ -162,6 +171,19 @@ function fazerBackup(){
   }catch(e){ console.warn('[backup] falhou:', e && e.message ? e.message : e); return null; }
 }
 const REGRA_SENHA = 'Palavra-passe fraca: use pelo menos 8 caracteres, com letras e números.';
+// ── Envio de email (Resend, por HTTPS) — usado na recuperação de palavra-passe ──
+function enviarEmailResend(para, assunto, html) {
+  return new Promise((resolve, reject) => {
+    if (!RESEND_API_KEY) { reject(new Error('RESEND_API_KEY em falta')); return; }
+    const payload = JSON.stringify({ from: MAIL_FROM, to: [para], subject: assunto, html: html });
+    const rq = https.request({ host: 'api.resend.com', path: '/emails', method: 'POST', headers: { 'Authorization': 'Bearer ' + RESEND_API_KEY, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } }, (r) => {
+      let d = ''; r.on('data', c => d += c);
+      r.on('end', () => { (r.statusCode >= 200 && r.statusCode < 300) ? resolve(true) : reject(new Error('Resend ' + r.statusCode + ' ' + d.slice(0, 200))); });
+    });
+    rq.on('error', reject); rq.write(payload); rq.end();
+  });
+}
+const _resetThrottle = new Map(); // email -> ts do último pedido (anti-spam)
 const _loginTent = new Map(); // chave(email|ip) -> {fails, until}
 function _loginChave(req, email){ const xf=String(req.headers['x-forwarded-for']||'').split(',')[0].trim(); const ip=xf||(req.socket&&req.socket.remoteAddress)||''; return String(email||'')+'|'+ip; }
 function _loginBloqueado(k){ const r=_loginTent.get(k); if(r&&r.until&&Date.now()<r.until) return Math.ceil((r.until-Date.now())/60000); return 0; }
@@ -235,6 +257,10 @@ const Q = {
   bumpSess: db.prepare('UPDATE users SET sess_ver=COALESCE(sess_ver,0)+1 WHERE id=? AND tenant_id=?'),
   insTenant: db.prepare('INSERT INTO tenants(id,nome,ver,criado_em) VALUES(?,?,0,?)'),
   countTenants: db.prepare('SELECT COUNT(*) AS n FROM tenants'),
+  upsertReset: db.prepare('INSERT INTO pass_reset(user_id,code_hash,expira,tentativas,criado) VALUES(?,?,?,0,?) ON CONFLICT(user_id) DO UPDATE SET code_hash=excluded.code_hash, expira=excluded.expira, tentativas=0, criado=excluded.criado'),
+  getReset: db.prepare('SELECT * FROM pass_reset WHERE user_id=?'),
+  bumpResetTent: db.prepare('UPDATE pass_reset SET tentativas=tentativas+1 WHERE user_id=?'),
+  delReset: db.prepare('DELETE FROM pass_reset WHERE user_id=?'),
   insUser: db.prepare('INSERT INTO users(id,tenant_id,email,pass_hash,nome,role,ativo,criado_em) VALUES(?,?,?,?,?,?,1,?)'),
   updUserPass: db.prepare('UPDATE users SET pass_hash=? WHERE id=?'),
   updUser: db.prepare('UPDATE users SET nome=?, role=? WHERE id=? AND tenant_id=?'),
@@ -625,6 +651,67 @@ const server = http.createServer(async (req, res) => {
       const buf = fs.readFileSync(fp);
       res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Disposition': 'attachment; filename="' + nome + '"', 'Content-Length': buf.length });
       return res.end(buf);
+    }
+
+    // — Diagnóstico do canal de email (administrador) —
+    if (p === '/api/auth/email-config' && req.method === 'GET') {
+      const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
+      if (!isAdmin(me.role)) return send(res, 403, { error: 'Apenas o Administrador' });
+      return send(res, 200, { configurado: !!RESEND_API_KEY, remetente: MAIL_FROM });
+    }
+    // — Teste de envio de email (administrador) — mostra o motivo real de falha —
+    if (p === '/api/auth/test-email' && req.method === 'POST') {
+      const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
+      if (!isAdmin(me.role)) return send(res, 403, { error: 'Apenas o Administrador' });
+      const b = await readBody(req);
+      const para = String(b.to || me.email || '').trim();
+      if (!para) return send(res, 400, { error: 'Indique o email de destino' });
+      if (!RESEND_API_KEY) return send(res, 400, { error: 'RESEND_API_KEY não está definida no servidor.' });
+      try {
+        await enviarEmailResend(para, 'Teste de email — AMDP',
+          '<div style="font-family:Arial,sans-serif;font-size:15px;color:#1a2330"><p>Este é um email de teste do sistema AMDP.</p><p>Se o recebeu, o canal de recuperação de palavra-passe está a funcionar.</p><p style="color:#8a99ab;font-size:12px">Remetente: ' + MAIL_FROM + '</p></div>');
+        return send(res, 200, { ok: true, remetente: MAIL_FROM });
+      } catch (e) {
+        return send(res, 502, { error: 'Falha no envio: ' + (e && e.message ? e.message : String(e)) });
+      }
+    }
+
+    // — Recuperação de palavra-passe (self-service, por email) —
+    if (p === '/api/auth/forgot' && req.method === 'POST') {
+      const b = await readBody(req);
+      const email = String(b.email || '').trim().toLowerCase();
+      // anti-spam: no máximo 1 pedido por email por 60s
+      const _last = _resetThrottle.get(email) || 0;
+      if (email && (Date.now() - _last) > 60000) {
+        _resetThrottle.set(email, Date.now());
+        const user = Q.userByEmail.get(email);
+        if (user && Number(user.ativo) !== 0) {
+          const code = String(Math.floor(100000 + Math.random() * 900000));   // 6 dígitos
+          const hash = crypto.createHmac('sha256', AUTH_SECRET).update(code).digest('hex');
+          try { Q.upsertReset.run(user.id, hash, Date.now() + 30 * 60 * 1000, Date.now()); } catch (e) {}
+          try {
+            await enviarEmailResend(user.email, 'Recuperação de palavra-passe — AMDP',
+              '<div style="font-family:Arial,sans-serif;font-size:15px;color:#1a2330"><p>Olá,</p><p>Recebemos um pedido para repor a palavra-passe da sua conta AMDP.</p><p>O seu código de recuperação é:</p><p style="font-size:26px;font-weight:bold;letter-spacing:3px;color:#1e8fc5">' + code + '</p><p>Este código é válido por <strong>30 minutos</strong>. Se não foi você que pediu, ignore este email — a sua palavra-passe não muda.</p><p style="color:#8a99ab;font-size:12px">AMDP — mensagem automática, não responda.</p></div>');
+          } catch (e) { console.warn('[forgot] email não enviado:', e && e.message ? e.message : e); }
+        }
+      }
+      // Resposta genérica — nunca revela se o email existe
+      return send(res, 200, { ok: true });
+    }
+    if (p === '/api/auth/reset' && req.method === 'POST') {
+      const b = await readBody(req);
+      const email = String(b.email || '').trim().toLowerCase();
+      const code = String(b.code || '').trim();
+      const np = String(b.newPassword || '');
+      if (senhaFraca(np)) return send(res, 400, { error: REGRA_SENHA });
+      const user = email ? Q.userByEmail.get(email) : null;
+      const rr = user ? Q.getReset.get(user.id) : null;
+      if (!user || !rr || !rr.expira || Date.now() > Number(rr.expira)) { if (user && rr) { try { Q.delReset.run(user.id); } catch (e) {} } return send(res, 400, { error: 'Código inválido ou expirado' }); }
+      if (Number(rr.tentativas) >= 5) { try { Q.delReset.run(user.id); } catch (e) {} return send(res, 429, { error: 'Demasiadas tentativas. Peça um novo código.' }); }
+      const hash = crypto.createHmac('sha256', AUTH_SECRET).update(code).digest('hex');
+      if (hash !== rr.code_hash) { try { Q.bumpResetTent.run(user.id); } catch (e) {} return send(res, 400, { error: 'Código inválido ou expirado' }); }
+      try { Q.updUserPass.run(hashPassword(np), user.id); Q.bumpSess.run(user.id, user.tenant_id); Q.delReset.run(user.id); } catch (e) { return send(res, 500, { error: 'Não foi possível repor a palavra-passe' }); }
+      return send(res, 200, { ok: true });
     }
 
     return send(res, 404, { error: 'Endpoint não encontrado' });
