@@ -279,7 +279,7 @@ const Q = {
   fiscalGet: db.prepare('SELECT seq FROM fiscal_seq WHERE tenant_id=? AND chave=?'),
   fiscalSet: db.prepare('INSERT INTO fiscal_seq(tenant_id,chave,seq) VALUES(?,?,?) ON CONFLICT(tenant_id,chave) DO UPDATE SET seq=excluded.seq'),
   insFile: db.prepare('INSERT INTO files(id,tenant_id,nome,tipo,dados,criado_em) VALUES(?,?,?,?,?,?)'),
-  getFile: db.prepare('SELECT nome,tipo,dados FROM files WHERE id=?'),
+  getFile: db.prepare('SELECT nome,tipo,dados,tenant_id FROM files WHERE id=?'),
 };
 
 // Transação simples (node:sqlite não tem helper próprio).
@@ -290,20 +290,31 @@ function tx(fn) {
 }
 
 // Aplica um lote de alterações de forma ATÓMICA e devolve a nova versão.
-function applyChanges(tenantId, clientId, autor, changes) {
+function applyChanges(tenantId, clientId, autor, changes, me) {
+  const areas = me ? visAreas(me) : 'all';
+  const idx = (areas === 'all') ? null : buildIdx(tenantId);
+  const podeApagar = me ? podeEliminarSrv(me) : true;
   return tx(() => {
     const row = Q.tenantVer.get(tenantId);
     let ver = Number((row && row.ver) || 0);
+    const aplicadas = [];
     for (const ch of changes) {
       if (!ch || !ch.tabela || ch.registoId == null) continue;
-      ver += 1;
       const del = ch.op === 'delete' ? 1 : 0;
+      // ELIMINAÇÃO só pelo Administrador. O pedido de um não-administrador é
+      // registado no cliente (tabela pedidos_eliminacao) e só é aplicado quando
+      // o Administrador o aprova — por isso aqui uma eliminação não autorizada é ignorada.
+      if (del && !podeApagar && ch.tabela !== 'pedidos_eliminacao') continue;
+      // ESCRITA só na própria divisão: um utilizador restrito não grava registos de outra área.
+      if (!del && areas !== 'all' && !recVisivel(areas, ch.tabela, ch.dados, idx)) continue;
+      ver += 1;
       Q.upsertRec.run(tenantId, String(ch.tabela), String(ch.registoId),
         del ? null : JSON.stringify(ch.dados), del, ver, clientId || null, autor || null, now());
       Q.insAudit.run(tenantId, autor || '', del ? 'eliminar' : 'alterar', String(ch.tabela), String(ch.registoId), now());
+      aplicadas.push(ch);
     }
     Q.bumpTenant.run(ver, tenantId);
-    return ver;
+    return { ver, aplicadas };
   });
 }
 
@@ -323,9 +334,19 @@ function nextFiscalSeq(tenantId, chave, min) {
 const streams = new Map(); // tenantId -> Set<{res, clientId}>
 function broadcast(tenantId, originClientId, changes, ver) {
   const set = streams.get(tenantId); if (!set || !set.size) return;
-  const payload = 'data: ' + JSON.stringify({ changes, ver }) + '\n\n';
+  const allPayload = 'data: ' + JSON.stringify({ changes, ver }) + '\n\n';
+  let idx = null, idxBuilt = false;
   for (const c of set) {
     if (originClientId && c.clientId === originClientId) continue; // não devolver ao próprio emissor
+    let payload = allPayload;
+    // Isolamento de divisões em tempo real: um utilizador restrito só recebe as
+    // alterações das suas divisões (as eliminações passam sempre, são inofensivas).
+    if (c.areas && c.areas !== 'all') {
+      if (!idxBuilt) { try { idx = buildIdx(tenantId); } catch (e) { idx = null; } idxBuilt = true; }
+      const vis = changes.filter(ch => (ch.op === 'delete') || recVisivel(c.areas, ch.tabela, ch.dados, idx));
+      if (!vis.length) continue;
+      payload = 'data: ' + JSON.stringify({ changes: vis, ver }) + '\n\n';
+    }
     try { c.res.write(payload); } catch (e) { }
   }
 }
@@ -341,6 +362,11 @@ function cors(res) {
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-File-Name');
   res.setHeader('Access-Control-Max-Age', '86400');
+  // Cabeçalhos de segurança (defesa em profundidade) em todas as respostas do servidor.
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
 }
 function readBody(req) {
   return new Promise((resolve) => {
@@ -370,6 +396,100 @@ function auth(req) {
 }
 function tokenForUser(u) {
   return signToken({ uid: u.id, tid: u.tenant_id, role: u.role, sv: Number(u.sess_ver || 0), exp: Date.now() + TOKEN_TTL_DAYS * 864e5 });
+}
+
+// ── Isolamento de divisões ao nível do SERVIDOR ─────────────────────────────
+// Um utilizador restrito a certas divisões NUNCA recebe (nem no pull, nem no
+// snapshot, nem no tempo-real) registos de divisões a que não tem acesso.
+// Princípio de segurança: na dúvida, o registo é tratado como COMUM (visível) —
+// assim nunca se escondem dados necessários; só se retêm os que têm, de forma
+// inequívoca, uma divisão concreta a que o utilizador não pertence.
+const _SETOR_KEYS = ['geral', 'motors', 'construcoes', 'saude', 'procurement', 'alimentar'];
+const _DIV2SETOR = {
+  'AMDP Motors': 'motors',
+  'Construções & Engenharia': 'construcoes',
+  'AMDP Saúde': 'saude',
+  'Procurement': 'procurement',
+  'Distribuição Alimentar': 'alimentar',
+  'Geral / AMDP': 'geral',
+  'Múltiplas': 'geral'
+};
+const _TRANSVERSAIS = { consulta: 1, contabilidade: 1, rh: 1 };
+const _TAB_SETOR = { facturas: 1, proformas: 1, orcamentos: 1, artigos: 1, recorrentes: 1, requisicoes: 1, consultas: 1, ordenscompra: 1 };
+const _TAB_DIVISAO = { leads: 1, propostas: 1, contratos: 1, fornecedores: 1 };
+const _qPerm = db.prepare("SELECT dados FROM records WHERE tenant_id=? AND tabela='utilizadores' AND registo_id=? AND deleted=0");
+const _qUtilAll = db.prepare("SELECT registo_id,dados FROM records WHERE tenant_id=? AND tabela='utilizadores' AND deleted=0");
+const _qRecsTab = db.prepare("SELECT registo_id,dados FROM records WHERE tenant_id=? AND tabela=? AND deleted=0");
+
+function _permRecord(me) {
+  try {
+    const email = String(me.email || '').toLowerCase();
+    let row = _qPerm.get(me.tenant_id, 'perm:' + email);
+    if (!row && email) {
+      const rows = _qUtilAll.all(me.tenant_id);
+      for (const r of rows) { try { const d = JSON.parse(r.dados); if (String(d.user || '').toLowerCase() === email) { row = { dados: r.dados }; break; } } catch (e) {} }
+    }
+    return row ? JSON.parse(row.dados) : null;
+  } catch (e) { return null; }
+}
+// Devolve 'all' (vê tudo) ou um array de chaves de divisão permitidas.
+function visAreas(me) {
+  if (isAdmin(me.role)) return 'all';
+  const perm = _permRecord(me);
+  if (perm) {
+    const pk = String(perm.perfilKey || '').toLowerCase();
+    if (pk === 'administrador' || isAdmin(perm.role)) return 'all';
+    if (_TRANSVERSAIS[pk]) return 'all';
+    if (perm.areas === 'all') return 'all';
+    if (Array.isArray(perm.areas)) return perm.areas.slice();
+    return [];            // perfil sem áreas e não transversal → sem divisões
+  }
+  return [];              // sem registo de permissões → acesso mínimo (seguro)
+}
+// Índice de divisões das tabelas-pai (cliente/fornecedor/artigo), para resolver
+// a divisão de contas-correntes e movimentos de stock. Só se constrói para
+// utilizadores restritos (o administrador não filtra nada).
+function buildIdx(tenantId) {
+  const idx = { cli: {}, forn: {}, art: {} };
+  try {
+    for (const r of _qRecsTab.all(tenantId, 'clientes')) { try { const d = JSON.parse(r.dados); let k = _DIV2SETOR[d.divisao]; if ((!k || k === 'geral') && Array.isArray(d.areas) && d.areas.length === 1) k = d.areas[0]; idx.cli[String(d.id != null ? d.id : r.registo_id)] = k || 'geral'; } catch (e) {} }
+    for (const r of _qRecsTab.all(tenantId, 'fornecedores')) { try { const d = JSON.parse(r.dados); idx.forn[String(d.id != null ? d.id : r.registo_id)] = _DIV2SETOR[d.divisao] || 'geral'; } catch (e) {} }
+    for (const r of _qRecsTab.all(tenantId, 'artigos')) { try { const d = JSON.parse(r.dados); idx.art[String(d.id != null ? d.id : r.registo_id)] = (d.setor && _SETOR_KEYS.indexOf(d.setor) >= 0) ? d.setor : 'geral'; } catch (e) {} }
+  } catch (e) {}
+  return idx;
+}
+// Divisão (chave) de um registo, ou null/'geral' se for comum/partilhado.
+function recSetor(tabela, dados, idx) {
+  if (!dados || typeof dados !== 'object') return null;
+  if (_TAB_SETOR[tabela]) { const s = dados.setor; return (s && _SETOR_KEYS.indexOf(s) >= 0) ? s : 'geral'; }
+  if (_TAB_DIVISAO[tabela]) { return _DIV2SETOR[dados.divisao] || 'geral'; }
+  if (tabela === 'viaturas' || tabela === 'ordens' || tabela === 'avaliacoes') return 'motors';
+  if (tabela === 'obras') return 'construcoes';
+  if (tabela === 'contacorrente') { if (dados.setor && _SETOR_KEYS.indexOf(dados.setor) >= 0 && dados.setor !== 'geral') return dados.setor; return (idx && idx.cli[String(dados.clienteId)]) || 'geral'; }
+  if (tabela === 'fcorrente') { return (idx && idx.forn[String(dados.fornId != null ? dados.fornId : dados.fornecedorId)]) || 'geral'; }
+  if (tabela === 'stockmovs') { return (idx && idx.art[String(dados.artigoId)]) || 'geral'; }
+  return null;            // qualquer outra tabela: comum (config, séries, utilizadores, etc.)
+}
+// Só o Administrador (ou perfil marcado como tal) pode ELIMINAR registos.
+// Os perfis transversais (contabilidade, etc.) veem tudo, mas NÃO eliminam.
+function podeEliminarSrv(me) {
+  if (isAdmin(me.role)) return true;
+  const perm = _permRecord(me);
+  if (perm && (String(perm.perfilKey || '').toLowerCase() === 'administrador' || isAdmin(perm.role) || perm.podeEliminar === true)) return true;
+  return false;
+}
+// Um registo é visível para um utilizador com estas áreas?
+function recVisivel(areasUser, tabela, dados, idx) {
+  if (areasUser === 'all') return true;
+  if (tabela === 'clientes') {
+    const as = Array.isArray(dados && dados.areas) ? dados.areas.slice() : [];
+    const dk = _DIV2SETOR[dados && dados.divisao]; if (dk && dk !== 'geral' && as.indexOf(dk) < 0) as.push(dk);
+    if (!as.length) return true;                       // sem divisão → comum
+    return as.some(a => areasUser.indexOf(a) >= 0);
+  }
+  const s = recSetor(tabela, dados, idx);
+  if (s == null || s === '' || s === 'geral') return true;   // comum/partilhado
+  return areasUser.indexOf(s) >= 0;
 }
 
 // ── Servidor ────────────────────────────────────────────────────────────────
@@ -431,11 +551,15 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/dados' && req.method === 'GET') {
       const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
       const rows = Q.allRecs.all(me.tenant_id);
+      const _areas = visAreas(me);
+      const _idx = (_areas === 'all') ? null : buildIdx(me.tenant_id);
       const dados = {};
       for (const r of rows) {
+        let _obj; try { _obj = JSON.parse(r.dados); } catch (e) { continue; }
+        if (!recVisivel(_areas, r.tabela, _obj, _idx)) continue;   // isolamento de divisões
         const key = 'amdp_crm_' + r.tabela;
         if (!dados[key]) dados[key] = [];
-        try { dados[key].push(JSON.parse(r.dados)); } catch (e) { }
+        dados[key].push(_obj);
       }
       Object.keys(dados).forEach(k => { dados[k] = JSON.stringify(dados[k]); });
       return send(res, 200, { dados });
@@ -452,9 +576,9 @@ const server = http.createServer(async (req, res) => {
         let arr; try { arr = JSON.parse(typeof dados[k] === 'string' ? dados[k] : JSON.stringify(dados[k])); } catch (e) { return; }
         if (Array.isArray(arr)) arr.forEach(rec => { if (rec && rec.id != null) changes.push({ tabela, registoId: rec.id, op: 'upsert', dados: rec }); });
       });
-      const ver = applyChanges(me.tenant_id, null, me.nome, changes);
-      broadcast(me.tenant_id, null, changes.map(c => ({ tabela: c.tabela, registoId: c.registoId, op: 'upsert', dados: c.dados })), ver);
-      return send(res, 200, { ok: true, ver });
+      const r = applyChanges(me.tenant_id, null, me.nome, changes, me);
+      if (r.aplicadas.length) broadcast(me.tenant_id, null, r.aplicadas.map(c => ({ tabela: c.tabela, registoId: c.registoId, op: 'upsert', dados: c.dados })), r.ver);
+      return send(res, 200, { ok: true, ver: r.ver });
     }
 
     // — Sincronização incremental: ENVIAR —
@@ -463,11 +587,11 @@ const server = http.createServer(async (req, res) => {
       const b = await readBody(req);
       const changes = Array.isArray(b.changes) ? b.changes : [];
       const clientId = b.clientId || null;
-      const ver = applyChanges(me.tenant_id, clientId, me.nome, changes);
-      broadcast(me.tenant_id, clientId, changes.map(c => ({
+      const r = applyChanges(me.tenant_id, clientId, me.nome, changes, me);
+      if (r.aplicadas.length) broadcast(me.tenant_id, clientId, r.aplicadas.map(c => ({
         tabela: c.tabela, registoId: c.registoId, op: c.op === 'delete' ? 'delete' : 'upsert', dados: c.op === 'delete' ? null : c.dados,
-      })), ver);
-      return send(res, 200, { ver });
+      })), r.ver);
+      return send(res, 200, { ver: r.ver });
     }
 
     // — Sincronização incremental: DESCARREGAR (catch-up) —
@@ -475,10 +599,16 @@ const server = http.createServer(async (req, res) => {
       const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
       const since = Number(u.searchParams.get('since') || 0);
       const rows = Q.changesSince.all(me.tenant_id, since);
-      const changes = rows.map(r => ({
-        tabela: r.tabela, registoId: r.registo_id, op: r.deleted ? 'delete' : 'upsert',
-        dados: r.deleted ? null : (() => { try { return JSON.parse(r.dados); } catch (e) { return null; } })(),
-      }));
+      const _areas = visAreas(me);
+      const _idx = (_areas === 'all') ? null : buildIdx(me.tenant_id);
+      const changes = [];
+      for (const r of rows) {
+        const _obj = r.deleted ? null : (() => { try { return JSON.parse(r.dados); } catch (e) { return null; } })();
+        // Eliminações passam sempre (inofensivas: o cliente nem tem o registo).
+        // Alterações só passam se a divisão for visível para este utilizador.
+        if (!r.deleted && !recVisivel(_areas, r.tabela, _obj, _idx)) continue;
+        changes.push({ tabela: r.tabela, registoId: r.registo_id, op: r.deleted ? 'delete' : 'upsert', dados: _obj });
+      }
       const vrow = Q.tenantVer.get(me.tenant_id);
       const ver = Number((vrow && vrow.ver) || 0);
       return send(res, 200, { changes, ver });
@@ -497,7 +627,7 @@ const server = http.createServer(async (req, res) => {
       res.write('retry: 3000\n\n');
       res.write(': ligado\n\n');
       if (!streams.has(me.tenant_id)) streams.set(me.tenant_id, new Set());
-      const entry = { res, clientId };
+      const entry = { res, clientId, areas: visAreas(me) };   // áreas p/ filtrar a difusão em tempo real
       streams.get(me.tenant_id).add(entry);
       const ka = setInterval(() => { try { res.write(': ping\n\n'); } catch (e) { } }, 25000);
       req.on('close', () => { clearInterval(ka); const s = streams.get(me.tenant_id); if (s) s.delete(entry); });
@@ -596,22 +726,32 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { url: _baseUrl(req) + '/api/files/' + id, id: id, store: 'db' });
     }
     if (p.startsWith('/api/files/') && req.method === 'GET') {
+      // Segurança: o descarregamento de ficheiros EXIGE sessão válida e só devolve
+      // ficheiros do PRÓPRIO tenant (impede que alguém com o link aceda a documentos
+      // de outra empresa). O cliente envia o token no cabeçalho Authorization ou em ?token=.
+      const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
       const id = decodeURIComponent(p.slice('/api/files/'.length));
       const row = id && Q.getFile.get(id);
       if (!row) return send(res, 404, { error: 'Ficheiro não encontrado' });
+      if (String(row.tenant_id) !== String(me.tenant_id)) return send(res, 403, { error: 'Sem acesso a este ficheiro' });
       const buf = Buffer.from(row.dados);
       const _nomeOrig = String(row.nome || 'ficheiro');
       // filename clássico: só ASCII imprimível, sem aspas/barra/; — evita "Invalid character in header"
       let _nomeAscii = _nomeOrig.replace(/[^\x20-\x7E]/g, '_').replace(/["\\;]/g, '').trim();
       if (!_nomeAscii) _nomeAscii = 'documento';
+      let _tipo = String(row.tipo || 'application/octet-stream').replace(/[^\x20-\x7E]/g, '') || 'application/octet-stream';
+      // Só se mostra INLINE o que é seguro (imagens rasterizadas e PDF). Tudo o resto — HTML,
+      // SVG (pode conter scripts), etc. — é forçado a descarregar, nunca executado no browser.
+      const inlineOk = /^image\/(png|jpe?g|gif|webp|bmp|avif)$/i.test(_tipo) || /^application\/pdf$/i.test(_tipo);
+      const disp = inlineOk ? 'inline' : 'attachment';
       let _cd;
-      try { _cd = "inline; filename=\"" + _nomeAscii + "\"; filename*=UTF-8''" + encodeURIComponent(_nomeOrig); } catch (e) { _cd = 'inline; filename="documento"'; }
-      const _tipo = String(row.tipo || 'application/octet-stream').replace(/[^\x20-\x7E]/g, '') || 'application/octet-stream';
+      try { _cd = disp + "; filename=\"" + _nomeAscii + "\"; filename*=UTF-8''" + encodeURIComponent(_nomeOrig); } catch (e) { _cd = disp + '; filename="documento"'; }
+      const _headers = { 'Content-Type': _tipo, 'Content-Disposition': _cd, 'Content-Length': buf.length, 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' };
       try {
-        res.writeHead(200, { 'Content-Type': _tipo, 'Content-Disposition': _cd, 'Content-Length': buf.length, 'Cache-Control': 'private, max-age=31536000' });
+        res.writeHead(200, _headers);
       } catch (e) {
         // Último recurso: cabeçalho mínimo garantidamente válido
-        res.writeHead(200, { 'Content-Type': _tipo, 'Content-Disposition': 'inline; filename="documento"', 'Content-Length': buf.length });
+        res.writeHead(200, { 'Content-Type': _tipo, 'Content-Disposition': disp + '; filename="documento"', 'Content-Length': buf.length, 'X-Content-Type-Options': 'nosniff' });
       }
       return res.end(buf);
     }
