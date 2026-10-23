@@ -534,7 +534,11 @@ const server = http.createServer(async (req, res) => {
       if (!user || Number(user.ativo) === 0 || !verifyPassword(pass, user.pass_hash)) { _loginFalhou(chave); return send(res, 401, { error: 'Email ou palavra-passe incorrectos' }); }
       _loginOk(chave);
       try { Q.setLastLogin.run(now(), user.id); } catch (e) {}
-      return send(res, 200, { token: tokenForUser(user), nome: user.nome, role: user.role, email: user.email });
+      // Devolve já as ÁREAS (divisões) permitidas, para o cliente não depender de a
+      // sincronização do registo de permissões ter chegado no instante do login.
+      let _perm = null, _va = 'all';
+      try { _perm = _permRecord(user); _va = visAreas(user); } catch (e) {}
+      return send(res, 200, { token: tokenForUser(user), nome: user.nome, role: (_perm && _perm.role) || user.role, email: user.email, perfilKey: (_perm && _perm.perfilKey) || undefined, areas: Array.isArray(_va) ? _va : undefined });
     }
 
     // — Trocar a própria palavra-passe —
