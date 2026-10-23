@@ -29,7 +29,7 @@ const TOKEN_TTL_DAYS = Number(process.env.TOKEN_TTL_DAYS || 30);
 const RESEND_API_KEY = process.env.RESEND_API_KEY || '';           // chave do Resend (envio de email)
 const MAIL_FROM = process.env.MAIL_FROM || 'AMDP <nao-responder@amdp.ao>';
 const BACKUP_DIR = path.join(DATA_DIR, 'backups');   // cópias diárias da base de dados
-const BACKUP_KEEP = Number(process.env.BACKUP_KEEP || 14); // quantas manter
+const BACKUP_KEEP = Number(process.env.BACKUP_KEEP || 5); // quantas manter (menos = menos espaço ocupado)
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 // Segurança: nunca usar um segredo por omissão conhecido. Se AUTH_SECRET não vier do
@@ -155,12 +155,24 @@ function isAdmin(role) { return /^admin/i.test(String(role || '')); }
 // ── Segurança de autenticação: força da palavra-passe + travão de tentativas ─
 function senhaFraca(pw){ pw=String(pw||''); return pw.length<8 || !/[A-Za-z]/.test(pw) || !/[0-9]/.test(pw); }
 // ── Cópia de segurança automática da base de dados ──────────────────────────
+function _freeBytes(){ try{ var s = fs.statfsSync(DATA_DIR); return s.bavail * s.bsize; }catch(e){ return -1; } }
 function fazerBackup(){
   try{
     if(!fs.existsSync(BACKUP_DIR)) fs.mkdirSync(BACKUP_DIR, { recursive: true });
+    // PRUNE PRIMEIRO: apaga cópias antigas ANTES de copiar — assim, mesmo com o disco quase
+    // cheio, liberta-se espaço (um disco cheio impediria a limpeza se ela viesse depois).
+    try{ var _fl0 = fs.readdirSync(BACKUP_DIR).filter(function(f){ return /^amdp-.*\.db$/.test(f); }).sort(); while(_fl0.length >= Math.max(1, BACKUP_KEEP)){ var _old0 = _fl0.shift(); try{ fs.unlinkSync(path.join(BACKUP_DIR, _old0)); }catch(e){} } }catch(e){}
     try{ db.exec('PRAGMA wal_checkpoint(TRUNCATE);'); }catch(e){}   // junta o WAL ao ficheiro principal
     const src = path.join(DATA_DIR, 'amdp.db');
     if(!fs.existsSync(src)) return null;
+    var _dbSize = 0; try{ _dbSize = fs.statSync(src).size; }catch(e){}
+    // Não criar a cópia se não houver espaço livre suficiente — uma cópia ocupa o
+    // tamanho da base, e encher o volume impediria o sistema de GRAVAR dados reais.
+    var _free = _freeBytes();
+    if(_free >= 0 && _dbSize > 0 && _free < _dbSize * 1.3){
+      console.warn('[backup] espaço insuficiente (' + Math.round(_free/1048576) + ' MB livres, base ' + Math.round(_dbSize/1048576) + ' MB) — cópia adiada para não encher o volume.');
+      return null;
+    }
     const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
     const dest = path.join(BACKUP_DIR, 'amdp-' + stamp + '.db');
     fs.copyFileSync(src, dest);
@@ -499,8 +511,23 @@ const server = http.createServer(async (req, res) => {
   const u = urlOf(req);
   const p = u.pathname;
   try {
-    // — Saúde —
-    if (p === '/' || p === '/api/health') return send(res, 200, { ok: true, servico: 'AMDP sync', tempo: now() });
+    // — Saúde / diagnóstico (abra este endereço no browser para verificar o servidor) —
+    if (p === '/' || p === '/api/health') {
+      var _dbB = 0, _bkB = 0, _bkN = 0, _escritaOk = false;
+      try { _dbB = fs.statSync(path.join(DATA_DIR, 'amdp.db')).size; } catch (e) {}
+      try { if (fs.existsSync(BACKUP_DIR)) { var _fl = fs.readdirSync(BACKUP_DIR).filter(function (f) { return /^amdp-.*\.db$/.test(f); }); _bkN = _fl.length; _fl.forEach(function (f) { try { _bkB += fs.statSync(path.join(BACKUP_DIR, f)).size; } catch (e) {} }); } } catch (e) {}
+      try { var _tf = path.join(DATA_DIR, '.writetest'); fs.writeFileSync(_tf, 'ok'); fs.unlinkSync(_tf); _escritaOk = true; } catch (e) { _escritaOk = false; }
+      var _mb = function (n) { return Math.round(n / 1048576 * 10) / 10; };
+      var _freeB = _freeBytes();
+      return send(res, 200, {
+        ok: true, servico: 'AMDP sync', versao: 'Z214', tempo: now(),
+        escrita_ok: _escritaOk,                      // false = disco cheio/sem permissão (os dados NÃO estão a ser guardados)
+        espaco_livre_mb: _freeB >= 0 ? _mb(_freeB) : 'desconhecido',
+        base_dados_mb: _mb(_dbB), copias: _bkN, copias_mb: _mb(_bkB), copias_max: BACKUP_KEEP,
+        ficheiros_na_base: r2Ativo() ? 'não (vão para o R2)' : 'sim (ocupam espaço na base)',
+        aviso: _escritaOk ? undefined : 'O SERVIDOR NÃO CONSEGUE GRAVAR — o volume do Railway está cheio. Aumente o volume (Redimensionar) e/ou reduza as cópias de segurança (BACKUP_KEEP) e ligue o R2 para os comprovativos.'
+      });
+    }
 
     // — Registo (cria empresa + administrador) —
     if (p === '/api/auth/register' && req.method === 'POST') {
