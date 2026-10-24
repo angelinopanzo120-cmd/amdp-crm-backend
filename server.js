@@ -115,6 +115,8 @@ CREATE TABLE IF NOT EXISTS pass_reset (
 // ── Migrações leves (colunas novas em instalações já existentes) ────────────
 try { db.exec("ALTER TABLE users ADD COLUMN last_login TEXT"); } catch (e) {}
 try { db.exec("ALTER TABLE users ADD COLUMN sess_ver INTEGER NOT NULL DEFAULT 0"); } catch (e) {}
+try { db.exec("ALTER TABLE users ADD COLUMN areas TEXT"); } catch (e) {}        // divisões permitidas (JSON) — fonte única de verdade
+try { db.exec("ALTER TABLE users ADD COLUMN perfil_key TEXT"); } catch (e) {}   // perfil (administrador/comercial/...)
 try { db.exec("ALTER TABLE files ADD COLUMN r2url TEXT"); } catch (e) {}   // ficheiro já movido para o R2 (dados fica NULL)
 
 // ── Utilitários: palavra-passe (scrypt) e token (HMAC) ──────────────────────
@@ -265,7 +267,7 @@ function _baseUrl(req) {
 const Q = {
   userByEmail: db.prepare('SELECT * FROM users WHERE lower(email)=lower(?)'),
   userById: db.prepare('SELECT * FROM users WHERE id=?'),
-  usersByTenant: db.prepare('SELECT id,email,nome,role,ativo,last_login FROM users WHERE tenant_id=? ORDER BY criado_em'),
+  usersByTenant: db.prepare('SELECT id,email,nome,role,ativo,last_login,areas,perfil_key FROM users WHERE tenant_id=? ORDER BY criado_em'),
   setLastLogin: db.prepare('UPDATE users SET last_login=? WHERE id=?'),
   bumpSess: db.prepare('UPDATE users SET sess_ver=COALESCE(sess_ver,0)+1 WHERE id=? AND tenant_id=?'),
   insTenant: db.prepare('INSERT INTO tenants(id,nome,ver,criado_em) VALUES(?,?,0,?)'),
@@ -277,6 +279,8 @@ const Q = {
   insUser: db.prepare('INSERT INTO users(id,tenant_id,email,pass_hash,nome,role,ativo,criado_em) VALUES(?,?,?,?,?,?,1,?)'),
   updUserPass: db.prepare('UPDATE users SET pass_hash=? WHERE id=?'),
   updUser: db.prepare('UPDATE users SET nome=?, role=? WHERE id=? AND tenant_id=?'),
+  setUserAreas: db.prepare('UPDATE users SET areas=?, perfil_key=? WHERE id=? AND tenant_id=?'),
+  usersAreasNull: db.prepare("SELECT id,email FROM users WHERE tenant_id=? AND (areas IS NULL OR areas='')"),
   delUser: db.prepare('DELETE FROM users WHERE id=? AND tenant_id=?'),
   tenantVer: db.prepare('SELECT ver FROM tenants WHERE id=?'),
   bumpTenant: db.prepare('UPDATE tenants SET ver=? WHERE id=?'),
@@ -432,6 +436,31 @@ const _DIV2SETOR = {
   'Múltiplas': 'geral'
 };
 const _TRANSVERSAIS = { consulta: 1, contabilidade: 1, rh: 1 };
+function _perfilKeySrv(role) {
+  const r = String(role || '').toLowerCase();
+  if (r.indexOf('admin') >= 0) return 'administrador';
+  if (r.indexOf('contab') >= 0) return 'contabilidade';
+  if (r.indexOf('human') >= 0 || r === 'rh') return 'rh';
+  if (r.indexOf('ofic') >= 0) return 'oficina';
+  if (r.indexOf('consulta') >= 0 || r.indexOf('leitura') >= 0) return 'consulta';
+  if (r.indexOf('comerc') >= 0) return 'comercial';
+  return 'administrador';
+}
+// Áreas guardadas na própria conta (users.areas, JSON). Null/erro → null.
+function _userAreasCol(u) {
+  try { if (u && u.areas != null && u.areas !== '') { const a = JSON.parse(u.areas); return (a === 'all' || Array.isArray(a)) ? a : null; } } catch (e) {}
+  return null;
+}
+// Grava as áreas e o perfil de uma conta (administrador → 'all'; senão só chaves válidas).
+function _guardarAreas(tenantId, userId, role, areas) {
+  const pk = _perfilKeySrv(role);
+  let val;
+  if (pk === 'administrador') val = 'all';
+  else if (areas === 'all') val = 'all';
+  else if (Array.isArray(areas)) val = areas.filter(function (k) { return _SETOR_KEYS.indexOf(k) >= 0; });
+  else val = [];
+  try { Q.setUserAreas.run(JSON.stringify(val), pk, userId, tenantId); } catch (e) {}
+}
 const _TAB_SETOR = { facturas: 1, proformas: 1, orcamentos: 1, artigos: 1, recorrentes: 1, requisicoes: 1, consultas: 1, ordenscompra: 1 };
 const _TAB_DIVISAO = { leads: 1, propostas: 1, contratos: 1, fornecedores: 1 };
 const _qPerm = db.prepare("SELECT dados FROM records WHERE tenant_id=? AND tabela='utilizadores' AND registo_id=? AND deleted=0");
@@ -453,16 +482,23 @@ function _permRecord(me) { return _permRecordBy(me.tenant_id, me.email); }
 // Devolve 'all' (vê tudo) ou um array de chaves de divisão permitidas.
 function visAreas(me) {
   if (isAdmin(me.role)) return 'all';
+  const pk = String(me.perfil_key || _perfilKeySrv(me.role) || '').toLowerCase();
+  if (pk === 'administrador') return 'all';
+  if (_TRANSVERSAIS[pk]) return 'all';
+  // 1) Fonte de verdade: as áreas guardadas na própria conta.
+  const ac = _userAreasCol(me);
+  if (ac === 'all') return 'all';
+  if (Array.isArray(ac)) return ac.filter(function (k) { return _SETOR_KEYS.indexOf(k) >= 0; });
+  // 2) Compatibilidade: registo de permissões antigo (até a conta ser gravada de novo).
   const perm = _permRecord(me);
   if (perm) {
-    const pk = String(perm.perfilKey || '').toLowerCase();
-    if (pk === 'administrador' || isAdmin(perm.role)) return 'all';
-    if (_TRANSVERSAIS[pk]) return 'all';
+    const pk2 = String(perm.perfilKey || '').toLowerCase();
+    if (pk2 === 'administrador' || isAdmin(perm.role)) return 'all';
+    if (_TRANSVERSAIS[pk2]) return 'all';
     if (perm.areas === 'all') return 'all';
-    if (Array.isArray(perm.areas)) return perm.areas.filter(function (k) { return _SETOR_KEYS.indexOf(k) >= 0; });   // ignora entradas inválidas/vazias
-    return [];            // perfil sem áreas e não transversal → sem divisões
+    if (Array.isArray(perm.areas)) return perm.areas.filter(function (k) { return _SETOR_KEYS.indexOf(k) >= 0; });
   }
-  return [];              // sem registo de permissões → acesso mínimo (seguro)
+  return [];
 }
 // Índice de divisões das tabelas-pai (cliente/fornecedor/artigo), para resolver
 // a divisão de contas-correntes e movimentos de stock. Só se constrói para
@@ -510,6 +546,24 @@ function recVisivel(areasUser, tabela, dados, idx) {
   return areasUser.indexOf(s) >= 0;
 }
 
+// ── Migração (uma vez): preenche users.areas a partir dos registos de permissões antigos ──
+try {
+  const _tns = db.prepare('SELECT id FROM tenants').all();
+  let _mg = 0;
+  for (const t of _tns) {
+    const us = Q.usersAreasNull.all(t.id);
+    for (const u of us) {
+      const full = Q.userById.get(u.id);
+      const perm = _permRecordBy(t.id, u.email);
+      const role = (full && full.role) || (perm && perm.role) || 'Comercial';
+      let areas = (perm && perm.areas !== undefined) ? perm.areas : [];
+      _guardarAreas(t.id, u.id, role, areas === 'all' ? 'all' : (Array.isArray(areas) ? areas : []));
+      _mg++;
+    }
+  }
+  if (_mg) console.log('[migracao] users.areas preenchido em ' + _mg + ' conta(s)');
+} catch (e) { console.warn('[migracao areas]', e && e.message ? e.message : e); }
+
 // ── Servidor ────────────────────────────────────────────────────────────────
 const server = http.createServer(async (req, res) => {
   cors(res);
@@ -526,7 +580,7 @@ const server = http.createServer(async (req, res) => {
       var _mb = function (n) { return Math.round(n / 1048576 * 10) / 10; };
       var _freeB = _freeBytes();
       return send(res, 200, {
-        ok: true, servico: 'AMDP sync', versao: 'Z216', tempo: now(),
+        ok: true, servico: 'AMDP sync', versao: 'Z217', tempo: now(),
         escrita_ok: _escritaOk,                      // false = disco cheio/sem permissão (os dados NÃO estão a ser guardados)
         espaco_livre_mb: _freeB >= 0 ? _mb(_freeB) : 'desconhecido',
         base_dados_mb: _mb(_dbB), copias: _bkN, copias_mb: _mb(_bkB), copias_max: BACKUP_KEEP,
@@ -567,11 +621,11 @@ const server = http.createServer(async (req, res) => {
       if (!user || Number(user.ativo) === 0 || !verifyPassword(pass, user.pass_hash)) { _loginFalhou(chave); return send(res, 401, { error: 'Email ou palavra-passe incorrectos' }); }
       _loginOk(chave);
       try { Q.setLastLogin.run(now(), user.id); } catch (e) {}
-      // Devolve já as ÁREAS (divisões) permitidas, para o cliente não depender de a
-      // sincronização do registo de permissões ter chegado no instante do login.
-      let _perm = null, _va = 'all';
-      try { _perm = _permRecord(user); _va = visAreas(user); } catch (e) {}
-      return send(res, 200, { token: tokenForUser(user), nome: user.nome, role: (_perm && _perm.role) || user.role, email: user.email, perfilKey: (_perm && _perm.perfilKey) || undefined, areas: Array.isArray(_va) ? _va : undefined });
+      // Devolve já as ÁREAS (divisões) permitidas e o perfil, para o cliente não
+      // depender de sincronização nenhuma no instante do login.
+      let _va = 'all';
+      try { _va = visAreas(user); } catch (e) {}
+      return send(res, 200, { token: tokenForUser(user), nome: user.nome, role: user.role, email: user.email, perfilKey: user.perfil_key || _perfilKeySrv(user.role), areas: Array.isArray(_va) ? _va : undefined });
     }
 
     // — Trocar a própria palavra-passe —
@@ -676,10 +730,10 @@ const server = http.createServer(async (req, res) => {
       const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
       if (!isAdmin(me.role)) return send(res, 403, { error: 'Apenas o Administrador' });
       return send(res, 200, { users: Q.usersByTenant.all(me.tenant_id).map(x => {
-        // Junta as ÁREAS e o PERFIL de cada conta (vêm do registo de permissões), para a
-        // lista mostrar as divisões em vez de "áreas por definir".
-        let _areas, _pk, _role = x.role;
-        try { const _pm = _permRecordBy(me.tenant_id, x.email); if (_pm) { _areas = _pm.areas; _pk = _pm.perfilKey; if (_pm.role) _role = _pm.role; } } catch (e) {}
+        // ÁREAS e PERFIL de cada conta: primeiro da própria conta (fonte de verdade),
+        // com recurso ao registo de permissões antigo enquanto a conta não for regravada.
+        let _areas = _userAreasCol(x), _pk = x.perfil_key || _perfilKeySrv(x.role), _role = x.role;
+        if (_areas == null) { try { const _pm = _permRecordBy(me.tenant_id, x.email); if (_pm) { if (_pm.areas !== undefined) _areas = _pm.areas; if (_pm.perfilKey) _pk = _pm.perfilKey; } } catch (e) {} }
         return { id: x.id, email: x.email, nome: x.nome, role: _role, perfilKey: _pk, areas: _areas, ativo: Number(x.ativo) !== 0, last_login: x.last_login || null };
       }) });
     }
@@ -692,7 +746,9 @@ const server = http.createServer(async (req, res) => {
       if (!email || !pass) return send(res, 400, { error: 'Email e palavra-passe obrigatórios' });
       if (senhaFraca(pass)) return send(res, 400, { error: REGRA_SENHA });
       if (Q.userByEmail.get(email)) return send(res, 409, { error: 'Email já existe' });
-      Q.insUser.run(newId('u_'), me.tenant_id, email, hashPassword(pass), String(b.nome || email.split('@')[0]), String(b.role || 'Comercial'), now());
+      const _uid = newId('u_');
+      Q.insUser.run(_uid, me.tenant_id, email, hashPassword(pass), String(b.nome || email.split('@')[0]), String(b.role || 'Comercial'), now());
+      _guardarAreas(me.tenant_id, _uid, String(b.role || 'Comercial'), b.areas);   // divisões permitidas
       return send(res, 200, { ok: true });
     }
     if (p === '/api/users/update' && req.method === 'POST') {
@@ -701,7 +757,9 @@ const server = http.createServer(async (req, res) => {
       const b = await readBody(req);
       const target = Q.userById.get(String(b.id || ''));
       if (!target || target.tenant_id !== me.tenant_id) return send(res, 404, { error: 'Conta não encontrada' });
-      Q.updUser.run(String(b.nome || target.nome), String(b.role || target.role), target.id, me.tenant_id);
+      const _novoRole = String(b.role || target.role);
+      Q.updUser.run(String(b.nome || target.nome), _novoRole, target.id, me.tenant_id);
+      if (b.areas !== undefined) _guardarAreas(me.tenant_id, target.id, _novoRole, b.areas);   // atualiza as divisões permitidas
       if (b.password) {
         if (senhaFraca(b.password)) return send(res, 400, { error: REGRA_SENHA });
         Q.updUserPass.run(hashPassword(String(b.password)), target.id);
