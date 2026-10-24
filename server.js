@@ -459,7 +459,7 @@ function visAreas(me) {
     if (pk === 'administrador' || isAdmin(perm.role)) return 'all';
     if (_TRANSVERSAIS[pk]) return 'all';
     if (perm.areas === 'all') return 'all';
-    if (Array.isArray(perm.areas)) return perm.areas.slice();
+    if (Array.isArray(perm.areas)) return perm.areas.filter(function (k) { return _SETOR_KEYS.indexOf(k) >= 0; });   // ignora entradas inválidas/vazias
     return [];            // perfil sem áreas e não transversal → sem divisões
   }
   return [];              // sem registo de permissões → acesso mínimo (seguro)
@@ -526,7 +526,7 @@ const server = http.createServer(async (req, res) => {
       var _mb = function (n) { return Math.round(n / 1048576 * 10) / 10; };
       var _freeB = _freeBytes();
       return send(res, 200, {
-        ok: true, servico: 'AMDP sync', versao: 'Z215', tempo: now(),
+        ok: true, servico: 'AMDP sync', versao: 'Z216', tempo: now(),
         escrita_ok: _escritaOk,                      // false = disco cheio/sem permissão (os dados NÃO estão a ser guardados)
         espaco_livre_mb: _freeB >= 0 ? _mb(_freeB) : 'desconhecido',
         base_dados_mb: _mb(_dbB), copias: _bkN, copias_mb: _mb(_bkB), copias_max: BACKUP_KEEP,
