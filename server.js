@@ -438,17 +438,18 @@ const _qPerm = db.prepare("SELECT dados FROM records WHERE tenant_id=? AND tabel
 const _qUtilAll = db.prepare("SELECT registo_id,dados FROM records WHERE tenant_id=? AND tabela='utilizadores' AND deleted=0");
 const _qRecsTab = db.prepare("SELECT registo_id,dados FROM records WHERE tenant_id=? AND tabela=? AND deleted=0");
 
-function _permRecord(me) {
+function _permRecordBy(tenantId, email) {
   try {
-    const email = String(me.email || '').toLowerCase();
-    let row = _qPerm.get(me.tenant_id, 'perm:' + email);
+    email = String(email || '').toLowerCase();
+    let row = _qPerm.get(tenantId, 'perm:' + email);
     if (!row && email) {
-      const rows = _qUtilAll.all(me.tenant_id);
+      const rows = _qUtilAll.all(tenantId);
       for (const r of rows) { try { const d = JSON.parse(r.dados); if (String(d.user || '').toLowerCase() === email) { row = { dados: r.dados }; break; } } catch (e) {} }
     }
     return row ? JSON.parse(row.dados) : null;
   } catch (e) { return null; }
 }
+function _permRecord(me) { return _permRecordBy(me.tenant_id, me.email); }
 // Devolve 'all' (vê tudo) ou um array de chaves de divisão permitidas.
 function visAreas(me) {
   if (isAdmin(me.role)) return 'all';
@@ -525,7 +526,7 @@ const server = http.createServer(async (req, res) => {
       var _mb = function (n) { return Math.round(n / 1048576 * 10) / 10; };
       var _freeB = _freeBytes();
       return send(res, 200, {
-        ok: true, servico: 'AMDP sync', versao: 'Z214', tempo: now(),
+        ok: true, servico: 'AMDP sync', versao: 'Z215', tempo: now(),
         escrita_ok: _escritaOk,                      // false = disco cheio/sem permissão (os dados NÃO estão a ser guardados)
         espaco_livre_mb: _freeB >= 0 ? _mb(_freeB) : 'desconhecido',
         base_dados_mb: _mb(_dbB), copias: _bkN, copias_mb: _mb(_bkB), copias_max: BACKUP_KEEP,
@@ -674,7 +675,13 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/users' && req.method === 'GET') {
       const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
       if (!isAdmin(me.role)) return send(res, 403, { error: 'Apenas o Administrador' });
-      return send(res, 200, { users: Q.usersByTenant.all(me.tenant_id).map(x => ({ id: x.id, email: x.email, nome: x.nome, role: x.role, ativo: Number(x.ativo) !== 0, last_login: x.last_login || null })) });
+      return send(res, 200, { users: Q.usersByTenant.all(me.tenant_id).map(x => {
+        // Junta as ÁREAS e o PERFIL de cada conta (vêm do registo de permissões), para a
+        // lista mostrar as divisões em vez de "áreas por definir".
+        let _areas, _pk, _role = x.role;
+        try { const _pm = _permRecordBy(me.tenant_id, x.email); if (_pm) { _areas = _pm.areas; _pk = _pm.perfilKey; if (_pm.role) _role = _pm.role; } } catch (e) {}
+        return { id: x.id, email: x.email, nome: x.nome, role: _role, perfilKey: _pk, areas: _areas, ativo: Number(x.ativo) !== 0, last_login: x.last_login || null };
+      }) });
     }
     if (p === '/api/users/create' && req.method === 'POST') {
       const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
