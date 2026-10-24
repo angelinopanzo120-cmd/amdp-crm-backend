@@ -115,6 +115,7 @@ CREATE TABLE IF NOT EXISTS pass_reset (
 // ── Migrações leves (colunas novas em instalações já existentes) ────────────
 try { db.exec("ALTER TABLE users ADD COLUMN last_login TEXT"); } catch (e) {}
 try { db.exec("ALTER TABLE users ADD COLUMN sess_ver INTEGER NOT NULL DEFAULT 0"); } catch (e) {}
+try { db.exec("ALTER TABLE files ADD COLUMN r2url TEXT"); } catch (e) {}   // ficheiro já movido para o R2 (dados fica NULL)
 
 // ── Utilitários: palavra-passe (scrypt) e token (HMAC) ──────────────────────
 function hashPassword(pw) {
@@ -291,7 +292,11 @@ const Q = {
   fiscalGet: db.prepare('SELECT seq FROM fiscal_seq WHERE tenant_id=? AND chave=?'),
   fiscalSet: db.prepare('INSERT INTO fiscal_seq(tenant_id,chave,seq) VALUES(?,?,?) ON CONFLICT(tenant_id,chave) DO UPDATE SET seq=excluded.seq'),
   insFile: db.prepare('INSERT INTO files(id,tenant_id,nome,tipo,dados,criado_em) VALUES(?,?,?,?,?,?)'),
-  getFile: db.prepare('SELECT nome,tipo,dados,tenant_id FROM files WHERE id=?'),
+  getFile: db.prepare('SELECT nome,tipo,dados,tenant_id,r2url FROM files WHERE id=?'),
+  // Migração de ficheiros da base para o R2
+  filesBlobCount: db.prepare('SELECT COUNT(*) AS n, COALESCE(SUM(LENGTH(dados)),0) AS bytes FROM files WHERE dados IS NOT NULL'),
+  filesBlobBatch: db.prepare('SELECT id,tenant_id,nome,tipo,dados FROM files WHERE dados IS NOT NULL LIMIT ?'),
+  fileSetR2: db.prepare('UPDATE files SET r2url=?, dados=NULL WHERE id=?'),
 };
 
 // Transação simples (node:sqlite não tem helper próprio).
@@ -765,6 +770,12 @@ const server = http.createServer(async (req, res) => {
       const row = id && Q.getFile.get(id);
       if (!row) return send(res, 404, { error: 'Ficheiro não encontrado' });
       if (String(row.tenant_id) !== String(me.tenant_id)) return send(res, 403, { error: 'Sem acesso a este ficheiro' });
+      // Ficheiro já migrado para o R2: redireciona para o endereço público (mantém os links antigos a funcionar).
+      if ((row.dados == null) && row.r2url) {
+        res.writeHead(302, { 'Location': String(row.r2url), 'Cache-Control': 'private, no-store' });
+        return res.end();
+      }
+      if (row.dados == null) return send(res, 404, { error: 'Ficheiro não encontrado' });
       const buf = Buffer.from(row.dados);
       const _nomeOrig = String(row.nome || 'ficheiro');
       // filename clássico: só ASCII imprimível, sem aspas/barra/; — evita "Invalid character in header"
@@ -785,6 +796,54 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(200, { 'Content-Type': _tipo, 'Content-Disposition': disp + '; filename="documento"', 'Content-Length': buf.length, 'X-Content-Type-Options': 'nosniff' });
       }
       return res.end(buf);
+    }
+
+    // — Armazenamento: estado (administrador) —
+    if (p === '/api/admin/storage' && req.method === 'GET') {
+      const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
+      if (!isAdmin(me.role)) return send(res, 403, { error: 'Apenas o Administrador' });
+      let c = { n: 0, bytes: 0 }; try { c = Q.filesBlobCount.get(); } catch (e) {}
+      const _free = _freeBytes(); const mb = function (n) { return Math.round(n / 1048576 * 10) / 10; };
+      let _dbB = 0; try { _dbB = fs.statSync(path.join(DATA_DIR, 'amdp.db')).size; } catch (e) {}
+      return send(res, 200, { r2_ativo: r2Ativo(), ficheiros_na_base: Number(c.n || 0), ficheiros_mb: mb(Number(c.bytes || 0)), base_mb: mb(_dbB), espaco_livre_mb: _free >= 0 ? mb(_free) : null });
+    }
+
+    // — Migrar comprovativos da base para o R2 (administrador) — por lotes, chamável várias vezes —
+    if (p === '/api/admin/migrar-r2' && req.method === 'POST') {
+      const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
+      if (!isAdmin(me.role)) return send(res, 403, { error: 'Apenas o Administrador' });
+      if (!r2Ativo()) return send(res, 400, { error: 'O R2 não está configurado. Defina as variáveis R2_* no Railway e recoloque o servidor.' });
+      const b = await readBody(req);
+      const lote = Math.min(50, Math.max(1, Number(b.lote) || 20));
+      let rows = []; try { rows = Q.filesBlobBatch.all(lote); } catch (e) { return send(res, 500, { error: 'Erro a ler ficheiros' }); }
+      let migrados = 0, bytes = 0, erros = 0;
+      for (const r of rows) {
+        try {
+          const buf = Buffer.from(r.dados);
+          const url = await r2Put(String(r.tenant_id) + '/' + String(r.id), buf, r.tipo || 'application/octet-stream');
+          Q.fileSetR2.run(url, r.id);
+          migrados++; bytes += buf.length;
+        } catch (e) { erros++; try { console.warn('[migrar-r2] falhou ' + r.id + ':', e && e.message ? e.message : e); } catch (_) {} }
+      }
+      let restam = 0; try { restam = Number(Q.filesBlobCount.get().n || 0); } catch (e) {}
+      const mb = function (n) { return Math.round(n / 1048576 * 10) / 10; };
+      return send(res, 200, { migrados: migrados, restantes: restam, mb_migrados_agora: mb(bytes), erros: erros });
+    }
+
+    // — Compactar a base de dados (VACUUM) para recuperar o espaço já libertado (administrador) —
+    if (p === '/api/admin/vacuum' && req.method === 'POST') {
+      const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
+      if (!isAdmin(me.role)) return send(res, 403, { error: 'Apenas o Administrador' });
+      let _dbSize = 0; try { _dbSize = fs.statSync(path.join(DATA_DIR, 'amdp.db')).size; } catch (e) {}
+      const _free = _freeBytes();
+      // O VACUUM precisa de espaço livre ~ ao tamanho da base (cria uma cópia temporária).
+      if (_free >= 0 && _dbSize > 0 && _free < _dbSize * 1.1) {
+        return send(res, 507, { error: 'Espaço insuficiente para compactar: precisa de cerca de ' + Math.round(_dbSize / 1048576) + ' MB livres. Aumente o volume no Railway temporariamente e tente de novo (depois pode reduzi-lo).' });
+      }
+      try { db.exec('VACUUM;'); } catch (e) { return send(res, 500, { error: 'Falha ao compactar: ' + (e && e.message ? e.message : e) }); }
+      let _novo = 0; try { _novo = fs.statSync(path.join(DATA_DIR, 'amdp.db')).size; } catch (e) {}
+      const mb = function (n) { return Math.round(n / 1048576 * 10) / 10; };
+      return send(res, 200, { ok: true, base_mb: mb(_novo) });
     }
 
     // — Terminar sessão de um utilizador à distância (administrador) —
