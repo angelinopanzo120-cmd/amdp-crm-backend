@@ -212,17 +212,23 @@ function _loginOk(k){ _loginTent.delete(k); }
 const R2 = {
   account:    process.env.R2_ACCOUNT_ID || '',
   bucket:     process.env.R2_BUCKET || '',
-  accessKey:  process.env.R2_ACCESS_KEY_ID || '',
-  secretKey:  process.env.R2_SECRET_ACCESS_KEY || '',
-  publicBase: String(process.env.R2_PUBLIC_BASE || '').replace(/\/+$/, '')
+  // Aceita os dois esquemas de nomes (os originais e os que já possas ter no Railway).
+  accessKey:  process.env.R2_ACCESS_KEY_ID || process.env.R2_ACCESS_KEY || '',
+  secretKey:  process.env.R2_SECRET_ACCESS_KEY || process.env.R2_SECRET || '',
+  publicBase: String(process.env.R2_PUBLIC_BASE || process.env.R2_PUBLIC_URL || '').replace(/\/+$/, ''),
+  endpoint:   String(process.env.R2_ENDPOINT || '').replace(/\/+$/, '')
 };
-function r2Ativo() { return !!(R2.account && R2.bucket && R2.accessKey && R2.secretKey && R2.publicBase); }
+// Deriva o Account ID a partir do endpoint, quando só o endpoint foi fornecido.
+if (!R2.account && R2.endpoint) { const _m = R2.endpoint.match(/^https?:\/\/([^.]+)\.r2\.cloudflarestorage\.com/i); if (_m) R2.account = _m[1]; }
+// Host S3 do R2 (sem protocolo): usa o endpoint se existir, senão constrói do account.
+R2.host = R2.endpoint ? R2.endpoint.replace(/^https?:\/\//, '') : (R2.account ? R2.account + '.r2.cloudflarestorage.com' : '');
+function r2Ativo() { return !!(R2.host && R2.bucket && R2.accessKey && R2.secretKey && R2.publicBase); }
 function _sha256hex(buf) { return crypto.createHash('sha256').update(buf).digest('hex'); }
 function _hmac(key, str) { return crypto.createHmac('sha256', key).update(str, 'utf8').digest(); }
 function r2Put(objKey, buf, contentType) {
   return new Promise((resolve, reject) => {
     try {
-      const host = R2.account + '.r2.cloudflarestorage.com';
+      const host = R2.host;
       const region = 'auto', service = 's3';
       const amzDate = new Date().toISOString().replace(/[:-]|\.\d{3}/g, ''); // YYYYMMDDTHHMMSSZ
       const dateStamp = amzDate.slice(0, 8);
@@ -580,11 +586,12 @@ const server = http.createServer(async (req, res) => {
       var _mb = function (n) { return Math.round(n / 1048576 * 10) / 10; };
       var _freeB = _freeBytes();
       return send(res, 200, {
-        ok: true, servico: 'AMDP sync', versao: 'Z217', tempo: now(),
+        ok: true, servico: 'AMDP sync', versao: 'Z220', tempo: now(),
         escrita_ok: _escritaOk,                      // false = disco cheio/sem permissão (os dados NÃO estão a ser guardados)
         espaco_livre_mb: _freeB >= 0 ? _mb(_freeB) : 'desconhecido',
         base_dados_mb: _mb(_dbB), copias: _bkN, copias_mb: _mb(_bkB), copias_max: BACKUP_KEEP,
         ficheiros_na_base: r2Ativo() ? 'não (vão para o R2)' : 'sim (ocupam espaço na base)',
+        r2: { ativo: r2Ativo(), bucket: !!R2.bucket, host: R2.host || '(em falta)', url_publico: !!R2.publicBase, chaves: !!(R2.accessKey && R2.secretKey) },
         aviso: _escritaOk ? undefined : 'O SERVIDOR NÃO CONSEGUE GRAVAR — o volume do Railway está cheio. Aumente o volume (Redimensionar) e/ou reduza as cópias de segurança (BACKUP_KEEP) e ligue o R2 para os comprovativos.'
       });
     }
