@@ -586,7 +586,7 @@ const server = http.createServer(async (req, res) => {
       var _mb = function (n) { return Math.round(n / 1048576 * 10) / 10; };
       var _freeB = _freeBytes();
       return send(res, 200, {
-        ok: true, servico: 'AMDP sync', versao: 'Z220', tempo: now(),
+        ok: true, servico: 'AMDP sync', versao: 'Z222', tempo: now(),
         escrita_ok: _escritaOk,                      // false = disco cheio/sem permissão (os dados NÃO estão a ser guardados)
         espaco_livre_mb: _freeB >= 0 ? _mb(_freeB) : 'desconhecido',
         base_dados_mb: _mb(_dbB), copias: _bkN, copias_mb: _mb(_bkB), copias_max: BACKUP_KEEP,
@@ -916,6 +916,24 @@ const server = http.createServer(async (req, res) => {
       let _novo = 0; try { _novo = fs.statSync(path.join(DATA_DIR, 'amdp.db')).size; } catch (e) {}
       const mb = function (n) { return Math.round(n / 1048576 * 10) / 10; };
       return send(res, 200, { ok: true, base_mb: mb(_novo) });
+    }
+
+    // — Diagnóstico do R2: confirma se os ficheiros públicos abrem mesmo (administrador) —
+    if (p === '/api/admin/r2-diag' && req.method === 'GET') {
+      const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
+      if (!isAdmin(me.role)) return send(res, 403, { error: 'Apenas o Administrador' });
+      if (!r2Ativo()) return send(res, 400, { error: 'O R2 não está configurado.' });
+      let _row = null; try { _row = db.prepare("SELECT r2url FROM files WHERE tenant_id=? AND r2url IS NOT NULL AND r2url<>'' LIMIT 1").get(me.tenant_id); } catch (e) {}
+      const _url = _row && _row.r2url;
+      if (!_url) return send(res, 200, { amostra: null, nota: 'Ainda não há ficheiros no R2 para testar.' });
+      const _st = await new Promise((resolve) => {
+        try {
+          const rq = https.get(_url, (r) => { r.resume(); resolve(r.statusCode); });
+          rq.on('error', () => resolve(-1));
+          rq.setTimeout(8000, () => { try { rq.destroy(); } catch (e) {} resolve(-2); });
+        } catch (e) { resolve(-1); }
+      });
+      return send(res, 200, { amostra: _url, status: _st, publico_ok: (_st >= 200 && _st < 400), public_base: R2.publicBase });
     }
 
     // — Terminar sessão de um utilizador à distância (administrador) —
