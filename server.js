@@ -607,7 +607,7 @@ const server = http.createServer(async (req, res) => {
       var _mb = function (n) { return Math.round(n / 1048576 * 10) / 10; };
       var _freeB = _freeBytes();
       return send(res, 200, {
-        ok: true, servico: 'AMDP sync', versao: 'Z224', tempo: now(),
+        ok: true, servico: 'AMDP sync', versao: 'Z226', tempo: now(),
         escrita_ok: _escritaOk,                      // false = disco cheio/sem permissão (os dados NÃO estão a ser guardados)
         espaco_livre_mb: _freeB >= 0 ? _mb(_freeB) : 'desconhecido',
         base_dados_mb: _mb(_dbB), copias: _bkN, copias_mb: _mb(_bkB), copias_max: BACKUP_KEEP,
@@ -847,7 +847,13 @@ const server = http.createServer(async (req, res) => {
       if (buf.length > MAX) return send(res, 413, { error: 'Ficheiro demasiado grande (máx. 30 MB)' });
       const id = newId('f_');
       if (r2Ativo()) {
-        try { const url = await r2Put(me.tenant_id + '/' + id, buf, ctype); return send(res, 200, { url: url, id: id, store: 'r2' }); }
+        try {
+          const r2url = await r2Put(me.tenant_id + '/' + id, buf, ctype);
+          // Regista o ficheiro SEM os bytes (dados NULL) + o r2url — assim o servidor serve-o
+          // com sessão (proxy do R2), tal como os migrados, sem depender de bucket público.
+          try { db.prepare('INSERT INTO files(id,tenant_id,nome,tipo,dados,criado_em,r2url) VALUES(?,?,?,?,?,?,?)').run(id, me.tenant_id, String(nome || 'ficheiro').slice(0, 200), ctype, null, now(), r2url); } catch (e) {}
+          return send(res, 200, { url: _baseUrl(req) + '/api/files/' + id, id: id, store: 'r2' });
+        }
         catch (e) { console.warn('[R2] falhou, a guardar no servidor:', e && e.message ? e.message : e); }
       }
       try { Q.insFile.run(id, me.tenant_id, String(nome || 'ficheiro').slice(0, 200), ctype, buf, now()); }
