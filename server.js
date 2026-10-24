@@ -263,6 +263,27 @@ function r2Put(objKey, buf, contentType) {
     } catch (e) { reject(e); }
   });
 }
+// Leitura ASSINADA de um objeto do R2 (não precisa de bucket público). Chama onResponse(r2res)
+// com a resposta HTTP do R2 (que se pode encaminhar diretamente ao cliente) ou onError(e).
+function r2GetStream(objKey, onResponse, onError) {
+  try {
+    const host = R2.host, region = 'auto', service = 's3';
+    const amzDate = new Date().toISOString().replace(/[:-]|\.\d{3}/g, '');
+    const dateStamp = amzDate.slice(0, 8);
+    const canonicalUri = '/' + R2.bucket + '/' + objKey.split('/').map(encodeURIComponent).join('/');
+    const payloadHash = _sha256hex(Buffer.from(''));
+    const canonicalHeaders = 'host:' + host + '\n' + 'x-amz-content-sha256:' + payloadHash + '\n' + 'x-amz-date:' + amzDate + '\n';
+    const signedHeaders = 'host;x-amz-content-sha256;x-amz-date';
+    const canonicalRequest = 'GET\n' + canonicalUri + '\n\n' + canonicalHeaders + '\n' + signedHeaders + '\n' + payloadHash;
+    const scope = dateStamp + '/' + region + '/' + service + '/aws4_request';
+    const stringToSign = 'AWS4-HMAC-SHA256\n' + amzDate + '\n' + scope + '\n' + _sha256hex(Buffer.from(canonicalRequest, 'utf8'));
+    const kDate = _hmac('AWS4' + R2.secretKey, dateStamp), kRegion = _hmac(kDate, region), kService = _hmac(kRegion, service), kSigning = _hmac(kService, 'aws4_request');
+    const signature = crypto.createHmac('sha256', kSigning).update(stringToSign, 'utf8').digest('hex');
+    const authorization = 'AWS4-HMAC-SHA256 Credential=' + R2.accessKey + '/' + scope + ', SignedHeaders=' + signedHeaders + ', Signature=' + signature;
+    const rq = https.request({ host: host, method: 'GET', path: canonicalUri, headers: { 'Authorization': authorization, 'x-amz-content-sha256': payloadHash, 'x-amz-date': amzDate } }, onResponse);
+    rq.on('error', onError); rq.setTimeout(20000, function () { try { rq.destroy(); } catch (e) {} onError(new Error('timeout')); }); rq.end();
+  } catch (e) { onError(e); }
+}
 function _baseUrl(req) {
   const proto = (req.headers['x-forwarded-proto'] || 'https').split(',')[0].trim();
   const host = req.headers['host'] || 'localhost';
@@ -586,7 +607,7 @@ const server = http.createServer(async (req, res) => {
       var _mb = function (n) { return Math.round(n / 1048576 * 10) / 10; };
       var _freeB = _freeBytes();
       return send(res, 200, {
-        ok: true, servico: 'AMDP sync', versao: 'Z222', tempo: now(),
+        ok: true, servico: 'AMDP sync', versao: 'Z223', tempo: now(),
         escrita_ok: _escritaOk,                      // false = disco cheio/sem permissão (os dados NÃO estão a ser guardados)
         espaco_livre_mb: _freeB >= 0 ? _mb(_freeB) : 'desconhecido',
         base_dados_mb: _mb(_dbB), copias: _bkN, copias_mb: _mb(_bkB), copias_max: BACKUP_KEEP,
@@ -842,13 +863,6 @@ const server = http.createServer(async (req, res) => {
       const row = id && Q.getFile.get(id);
       if (!row) return send(res, 404, { error: 'Ficheiro não encontrado' });
       if (String(row.tenant_id) !== String(me.tenant_id)) return send(res, 403, { error: 'Sem acesso a este ficheiro' });
-      // Ficheiro já migrado para o R2: redireciona para o endereço público (mantém os links antigos a funcionar).
-      if ((row.dados == null) && row.r2url) {
-        res.writeHead(302, { 'Location': String(row.r2url), 'Cache-Control': 'private, no-store' });
-        return res.end();
-      }
-      if (row.dados == null) return send(res, 404, { error: 'Ficheiro não encontrado' });
-      const buf = Buffer.from(row.dados);
       const _nomeOrig = String(row.nome || 'ficheiro');
       // filename clássico: só ASCII imprimível, sem aspas/barra/; — evita "Invalid character in header"
       let _nomeAscii = _nomeOrig.replace(/[^\x20-\x7E]/g, '_').replace(/["\\;]/g, '').trim();
@@ -860,6 +874,30 @@ const server = http.createServer(async (req, res) => {
       const disp = inlineOk ? 'inline' : 'attachment';
       let _cd;
       try { _cd = disp + "; filename=\"" + _nomeAscii + "\"; filename*=UTF-8''" + encodeURIComponent(_nomeOrig); } catch (e) { _cd = disp + '; filename="documento"'; }
+
+      // Ficheiro já migrado para o R2: o SERVIDOR busca-o ao R2 (com credenciais, sem precisar
+      // de bucket público) e entrega-o. Se isso falhar, tenta o redirecionamento público.
+      if ((row.dados == null) && row.r2url) {
+        const _objKey = String(row.tenant_id) + '/' + id;
+        let _done = false;
+        r2GetStream(_objKey, function (r2res) {
+          if (r2res.statusCode >= 200 && r2res.statusCode < 300) {
+            _done = true;
+            var h = { 'Content-Type': _tipo, 'Content-Disposition': _cd, 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' };
+            if (r2res.headers['content-length']) h['Content-Length'] = r2res.headers['content-length'];
+            try { res.writeHead(200, h); } catch (e) { try { res.writeHead(200, { 'Content-Type': _tipo }); } catch (_) {} }
+            r2res.pipe(res);
+          } else {
+            r2res.resume();
+            if (!_done) { _done = true; try { res.writeHead(302, { 'Location': String(row.r2url), 'Cache-Control': 'private, no-store' }); } catch (e) {} res.end(); }
+          }
+        }, function () {
+          if (!_done) { _done = true; try { res.writeHead(302, { 'Location': String(row.r2url), 'Cache-Control': 'private, no-store' }); res.end(); } catch (e) { try { res.writeHead(502); res.end(); } catch (_) {} } }
+        });
+        return;
+      }
+      if (row.dados == null) return send(res, 404, { error: 'Ficheiro não encontrado' });
+      const buf = Buffer.from(row.dados);
       const _headers = { 'Content-Type': _tipo, 'Content-Disposition': _cd, 'Content-Length': buf.length, 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' };
       try {
         res.writeHead(200, _headers);
