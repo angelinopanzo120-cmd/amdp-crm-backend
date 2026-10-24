@@ -607,7 +607,7 @@ const server = http.createServer(async (req, res) => {
       var _mb = function (n) { return Math.round(n / 1048576 * 10) / 10; };
       var _freeB = _freeBytes();
       return send(res, 200, {
-        ok: true, servico: 'AMDP sync', versao: 'Z223', tempo: now(),
+        ok: true, servico: 'AMDP sync', versao: 'Z224', tempo: now(),
         escrita_ok: _escritaOk,                      // false = disco cheio/sem permissão (os dados NÃO estão a ser guardados)
         espaco_livre_mb: _freeB >= 0 ? _mb(_freeB) : 'desconhecido',
         base_dados_mb: _mb(_dbB), copias: _bkN, copias_mb: _mb(_bkB), copias_max: BACKUP_KEEP,
@@ -961,17 +961,24 @@ const server = http.createServer(async (req, res) => {
       const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
       if (!isAdmin(me.role)) return send(res, 403, { error: 'Apenas o Administrador' });
       if (!r2Ativo()) return send(res, 400, { error: 'O R2 não está configurado.' });
-      let _row = null; try { _row = db.prepare("SELECT r2url FROM files WHERE tenant_id=? AND r2url IS NOT NULL AND r2url<>'' LIMIT 1").get(me.tenant_id); } catch (e) {}
+      let _row = null; try { _row = db.prepare("SELECT id,r2url FROM files WHERE tenant_id=? AND r2url IS NOT NULL AND r2url<>'' LIMIT 1").get(me.tenant_id); } catch (e) {}
       const _url = _row && _row.r2url;
       if (!_url) return send(res, 200, { amostra: null, nota: 'Ainda não há ficheiros no R2 para testar.' });
-      const _st = await new Promise((resolve) => {
-        try {
-          const rq = https.get(_url, (r) => { r.resume(); resolve(r.statusCode); });
-          rq.on('error', () => resolve(-1));
-          rq.setTimeout(8000, () => { try { rq.destroy(); } catch (e) {} resolve(-2); });
-        } catch (e) { resolve(-1); }
+      // 1) LEITURA ASSINADA (o caminho REAL que o sistema usa — não precisa de bucket público).
+      const _objKey = String(me.tenant_id) + '/' + String(_row.id);
+      const _assin = await new Promise((resolve) => {
+        var _d = '';
+        r2GetStream(_objKey, function (r) { r.on('data', function (c) { if (_d.length < 300) _d += c.toString(); }); r.on('end', function () { resolve({ status: r.statusCode, corpo: _d.slice(0, 200) }); }); }, function (e) { resolve({ status: -1, corpo: String(e && e.message || e).slice(0, 120) }); });
       });
-      return send(res, 200, { amostra: _url, status: _st, publico_ok: (_st >= 200 && _st < 400), public_base: R2.publicBase });
+      // 2) ACESSO PÚBLICO (só informativo — já não é necessário).
+      const _pub = await new Promise((resolve) => {
+        try { const rq = https.get(_url, (r) => { r.resume(); resolve(r.statusCode); }); rq.on('error', () => resolve(-1)); rq.setTimeout(8000, () => { try { rq.destroy(); } catch (e) {} resolve(-2); }); } catch (e) { resolve(-1); }
+      });
+      return send(res, 200, {
+        amostra: _url, host: R2.host, bucket: R2.bucket,
+        assinado_status: _assin.status, assinado_ok: (_assin.status >= 200 && _assin.status < 300), assinado_detalhe: _assin.corpo,
+        publico_status: _pub, publico_ok: (_pub >= 200 && _pub < 400)
+      });
     }
 
     // — Terminar sessão de um utilizador à distância (administrador) —
