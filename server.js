@@ -15,6 +15,8 @@
 'use strict';
 const http = require('http');
 const https = require('https');
+const net = require('net');
+const tls = require('tls');
 const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
@@ -26,8 +28,17 @@ const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data'); // monte 
 let AUTH_SECRET = process.env.AUTH_SECRET || '';
 const ALLOW_REGISTER = process.env.ALLOW_REGISTER === '1'; // registo aberto só se =1 (senão só o 1.º arranque)
 const TOKEN_TTL_DAYS = Number(process.env.TOKEN_TTL_DAYS || 30);
-const RESEND_API_KEY = process.env.RESEND_API_KEY || '';           // chave do Resend (envio de email)
-const MAIL_FROM = process.env.MAIL_FROM || 'AMDP <nao-responder@amdp.ao>';
+const RESEND_API_KEY = process.env.RESEND_API_KEY || '';           // chave do Resend (envio de email, alternativa ao SMTP)
+// ── SMTP (mesmo canal usado pelo serviço de Cobranças) — tem prioridade sobre o Resend ──
+const SMTP_HOST = process.env.SMTP_HOST || '';
+const SMTP_PORT = Number(process.env.SMTP_PORT || 465);
+const SMTP_USER = process.env.SMTP_USER || '';
+const SMTP_PASS = process.env.SMTP_PASS || '';
+const SMTP_SECURE = process.env.SMTP_SECURE ? (process.env.SMTP_SECURE === '1' || process.env.SMTP_SECURE === 'true') : (SMTP_PORT === 465); // 465 = TLS direto; 587/25 = STARTTLS
+// remetente: MAIL_FROM, senão EMAIL_FROM (nome usado nas Cobranças), senão valor por omissão
+const MAIL_FROM = process.env.MAIL_FROM || process.env.EMAIL_FROM || 'AMDP <nao-responder@amdp.ao>';
+function _emailConfigurado() { return !!(SMTP_HOST && SMTP_USER && SMTP_PASS) || !!RESEND_API_KEY; }
+function _emailCanal() { return (SMTP_HOST && SMTP_USER && SMTP_PASS) ? 'smtp' : (RESEND_API_KEY ? 'resend' : 'nenhum'); }
 const BACKUP_DIR = path.join(DATA_DIR, 'backups');   // cópias diárias da base de dados
 const BACKUP_KEEP = Number(process.env.BACKUP_KEEP || 5); // quantas manter (menos = menos espaço ocupado)
 
@@ -197,6 +208,87 @@ function enviarEmailResend(para, assunto, html) {
     });
     rq.on('error', reject); rq.write(payload); rq.end();
   });
+}
+
+// ── Envio de email por SMTP (módulos nativos net/tls, sem dependências) ──
+// Suporta TLS direto (porta 465) e STARTTLS (587/25); AUTH LOGIN ou PLAIN.
+function enviarEmailSMTP(para, assunto, html) {
+  return new Promise((resolve, reject) => {
+    if (!SMTP_HOST) { reject(new Error('SMTP_HOST em falta')); return; }
+    if (!SMTP_USER || !SMTP_PASS) { reject(new Error('SMTP_USER/SMTP_PASS em falta')); return; }
+    const host = SMTP_HOST, porta = SMTP_PORT || 465;
+    const mFrom = /<([^>]+)>/.exec(MAIL_FROM); const fromAddr = (mFrom ? mFrom[1] : MAIL_FROM).trim();
+    const toAddr = String(para).trim();
+    let sock, buf = '', curLines = [], resolver = null, pending = [], finished = false;
+    const tmr = setTimeout(() => { if (!finished) { finished = true; try { sock && sock.destroy(); } catch (e) {} reject(new Error('SMTP: tempo esgotado (ligação lenta ou porta errada)')); } }, 25000);
+    function done(err) { if (finished) return; finished = true; clearTimeout(tmr); if (err) { try { sock && sock.destroy(); } catch (e) {} reject(err instanceof Error ? err : new Error(String(err))); } else { try { sock && sock.end(); } catch (e) {} resolve(true); } }
+    function onData(chunk) {
+      buf += chunk.toString('utf8'); let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        let line = buf.slice(0, i); buf = buf.slice(i + 1); if (line.endsWith('\r')) line = line.slice(0, -1);
+        if (line.length < 3) continue;
+        curLines.push(line);
+        const isFinal = (line.charAt(3) === ' ') || (line.length === 3);
+        if (isFinal) {
+          const code = parseInt(line.slice(0, 3), 10);
+          const resp = { code: code, text: curLines.join('\n') }; curLines = [];
+          if (resolver) { const r = resolver; resolver = null; r(resp); }
+          else pending.push(resp);
+        }
+      }
+    }
+    function expect(codes) {
+      return new Promise((res, rej) => {
+        const evalResp = (resp) => { if (codes.indexOf(resp.code) >= 0) res(resp); else rej(new Error('SMTP ' + String(resp.text).slice(0, 180))); };
+        if (pending.length) evalResp(pending.shift());
+        else resolver = evalResp;
+      });
+    }
+    function write(cmd) { try { sock.write(cmd + '\r\n'); } catch (e) { done(e); } }
+    function attach(s) { s.on('data', onData); s.on('error', e => done(new Error('SMTP erro de ligação: ' + (e && e.message ? e.message : e)))); s.on('close', () => { if (!finished) done(new Error('SMTP: ligação fechada inesperadamente')); }); }
+    function upgradeTLS(plain) { return new Promise((res, rej) => { try { plain.removeAllListeners('data'); plain.removeAllListeners('error'); plain.removeAllListeners('close'); } catch (e) {} const t = tls.connect({ socket: plain, servername: host, rejectUnauthorized: false }, () => res(t)); t.once('error', rej); }); }
+    function b64(s) { return Buffer.from(s, 'utf8').toString('base64'); }
+    function construirMensagem() {
+      const corpo = b64(html).replace(/(.{76})/g, '$1\r\n');
+      return [
+        'From: ' + MAIL_FROM,
+        'To: ' + toAddr,
+        'Subject: =?UTF-8?B?' + b64(assunto) + '?=',
+        'MIME-Version: 1.0',
+        'Content-Type: text/html; charset=UTF-8',
+        'Content-Transfer-Encoding: base64',
+        'Date: ' + new Date().toUTCString(),
+        'Message-ID: <' + crypto.randomBytes(12).toString('hex') + '@amdp.ao>'
+      ].join('\r\n') + '\r\n\r\n' + corpo;
+    }
+    async function run() {
+      await expect([220]);
+      write('EHLO amdp.ao'); await expect([250]);
+      if (!SMTP_SECURE) { write('STARTTLS'); await expect([220]); sock = await upgradeTLS(sock); attach(sock); write('EHLO amdp.ao'); await expect([250]); }
+      write('AUTH LOGIN'); await expect([334]);
+      write(b64(SMTP_USER)); await expect([334]);
+      write(b64(SMTP_PASS)); await expect([235]);
+      write('MAIL FROM:<' + fromAddr + '>'); await expect([250]);
+      write('RCPT TO:<' + toAddr + '>'); await expect([250, 251]);
+      write('DATA'); await expect([354]);
+      try { sock.write(construirMensagem() + '\r\n.\r\n'); } catch (e) { throw e; }
+      await expect([250]);
+      write('QUIT');
+    }
+    try {
+      if (SMTP_SECURE) sock = tls.connect({ host: host, port: porta, servername: host, rejectUnauthorized: false }, () => {});
+      else sock = net.connect({ host: host, port: porta }, () => {});
+      attach(sock);
+      run().then(() => done()).catch(e => done(e));
+    } catch (e) { done(e); }
+  });
+}
+
+// ── Despachante genérico: usa SMTP se configurado, senão Resend ──
+function enviarEmail(para, assunto, html) {
+  if (SMTP_HOST && SMTP_USER && SMTP_PASS) return enviarEmailSMTP(para, assunto, html);
+  if (RESEND_API_KEY) return enviarEmailResend(para, assunto, html);
+  return Promise.reject(new Error('Nenhum canal de email configurado no servidor (defina SMTP_HOST/SMTP_USER/SMTP_PASS, ou RESEND_API_KEY).'));
 }
 const _resetThrottle = new Map(); // email -> ts do último pedido (anti-spam)
 const _loginTent = new Map(); // chave(email|ip) -> {fails, until}
@@ -607,7 +699,7 @@ const server = http.createServer(async (req, res) => {
       var _mb = function (n) { return Math.round(n / 1048576 * 10) / 10; };
       var _freeB = _freeBytes();
       return send(res, 200, {
-        ok: true, servico: 'AMDP sync', versao: 'Z226', tempo: now(),
+        ok: true, servico: 'AMDP sync', versao: 'Z227', tempo: now(),
         escrita_ok: _escritaOk,                      // false = disco cheio/sem permissão (os dados NÃO estão a ser guardados)
         espaco_livre_mb: _freeB >= 0 ? _mb(_freeB) : 'desconhecido',
         base_dados_mb: _mb(_dbB), copias: _bkN, copias_mb: _mb(_bkB), copias_max: BACKUP_KEEP,
@@ -1028,7 +1120,7 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/auth/email-config' && req.method === 'GET') {
       const me = auth(req); if (!me) return send(res, 401, { error: 'Sessão inválida' });
       if (!isAdmin(me.role)) return send(res, 403, { error: 'Apenas o Administrador' });
-      return send(res, 200, { configurado: !!RESEND_API_KEY, remetente: MAIL_FROM });
+      return send(res, 200, { configurado: _emailConfigurado(), canal: _emailCanal(), remetente: MAIL_FROM });
     }
     // — Teste de envio de email (administrador) — mostra o motivo real de falha —
     if (p === '/api/auth/test-email' && req.method === 'POST') {
@@ -1037,9 +1129,9 @@ const server = http.createServer(async (req, res) => {
       const b = await readBody(req);
       const para = String(b.to || me.email || '').trim();
       if (!para) return send(res, 400, { error: 'Indique o email de destino' });
-      if (!RESEND_API_KEY) return send(res, 400, { error: 'RESEND_API_KEY não está definida no servidor.' });
+      if (!_emailConfigurado()) return send(res, 400, { error: 'Nenhum canal de email configurado no servidor (defina SMTP_HOST/SMTP_USER/SMTP_PASS, ou RESEND_API_KEY).' });
       try {
-        await enviarEmailResend(para, 'Teste de email — AMDP',
+        await enviarEmail(para, 'Teste de email — AMDP',
           '<div style="font-family:Arial,sans-serif;font-size:15px;color:#1a2330"><p>Este é um email de teste do sistema AMDP.</p><p>Se o recebeu, o canal de recuperação de palavra-passe está a funcionar.</p><p style="color:#8a99ab;font-size:12px">Remetente: ' + MAIL_FROM + '</p></div>');
         return send(res, 200, { ok: true, remetente: MAIL_FROM });
       } catch (e) {
@@ -1061,7 +1153,7 @@ const server = http.createServer(async (req, res) => {
           const hash = crypto.createHmac('sha256', AUTH_SECRET).update(code).digest('hex');
           try { Q.upsertReset.run(user.id, hash, Date.now() + 30 * 60 * 1000, Date.now()); } catch (e) {}
           try {
-            await enviarEmailResend(user.email, 'Recuperação de palavra-passe — AMDP',
+            await enviarEmail(user.email, 'Recuperação de palavra-passe — AMDP',
               '<div style="font-family:Arial,sans-serif;font-size:15px;color:#1a2330"><p>Olá,</p><p>Recebemos um pedido para repor a palavra-passe da sua conta AMDP.</p><p>O seu código de recuperação é:</p><p style="font-size:26px;font-weight:bold;letter-spacing:3px;color:#1e8fc5">' + code + '</p><p>Este código é válido por <strong>30 minutos</strong>. Se não foi você que pediu, ignore este email — a sua palavra-passe não muda.</p><p style="color:#8a99ab;font-size:12px">AMDP — mensagem automática, não responda.</p></div>');
           } catch (e) { console.warn('[forgot] email não enviado:', e && e.message ? e.message : e); }
         }
